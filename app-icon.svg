@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Mosaic app icon. Source of truth for every generated size:
+       regenerate with `pnpm tauri icon app-icon.svg`.
+
+       Staggered tesserae in the app's own brain palette (src/lib/brains.ts).
+       Rows 1 and 3 sit on columns 0/3/6, row 2 is offset to 1/4 — the running
+       bond that reads as a mosaic rather than a uniform grid, while keeping
+       tiles large enough to survive a 16px taskbar icon. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2130"/>
+      <stop offset="1" stop-color="#16161e"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="180" fill="url(#bg)"/>
+
+  <g>
+    <!-- row 1 -->
+    <rect x="140" y="194" width="204" height="204" rx="20" fill="#7aa2f7"/>
+    <rect x="464" y="194" width="204" height="204" rx="20" fill="#9ece6a"/>
+    <rect x="788" y="194" width="96"  height="204" rx="20" fill="#bb9af7"/>
+    <!-- row 2, offset -->
+    <rect x="248" y="410" width="204" height="204" rx="20" fill="#e0af68"/>
+    <rect x="572" y="410" width="204" height="204" rx="20" fill="#7dcfff"/>
+    <!-- row 3 -->
+    <rect x="140" y="626" width="204" height="204" rx="20" fill="#f7768e"/>
+    <rect x="464" y="626" width="204" height="204" rx="20" fill="#ff9e64"/>
+    <rect x="788" y="626" width="96"  height="204" rx="20" fill="#b4f9f8"/>
+  </g>
+</svg>

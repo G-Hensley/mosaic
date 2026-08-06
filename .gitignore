@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# `tauri icon` emits mobile icon sets too. This app is Windows-only (ConPTY), and
+# they regenerate from app-icon.svg, so there is nothing to gain from tracking them.
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
 # Shared-brain runtime data. Written into whichever project is active; when that
 # project is Mosaic itself, it's just scratch from a test run.
 .mosaic/
