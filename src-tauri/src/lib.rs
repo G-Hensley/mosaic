@@ -12,9 +12,10 @@ mod worktree;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -28,26 +29,72 @@ struct SessionHandle {
     child: Box<dyn Child + Send + Sync>,
     /// Present when this session runs isolated in its own git worktree.
     worktree: Option<worktree::Worktree>,
+    /// When this session last produced output, on the `mono_ms` clock. Written by
+    /// the reader thread, read by `submit_to` to tell when a target has finished
+    /// absorbing a pasted prompt. See `SUBMIT_QUIET_MS`.
+    last_output: Arc<AtomicU64>,
 }
 
-/// How long to wait between writing a prompt and writing the Enter that submits
-/// it.
+/// Process-monotonic millisecond clock, used to time the gap between a prompt
+/// and the Enter that submits it.
 ///
-/// This is not a generic "let the UI settle" pause — it is sized against a
-/// specific, documented behaviour in the Codex TUI. Codex detects pasted input
-/// by burst timing, and for `PASTE_ENTER_SUPPRESS_WINDOW` (120 ms, anchored to
-/// the *last character received*, not to the flush) it deliberately treats a
-/// carriage return as "newline inside the paste" rather than "submit". An Enter
-/// sent inside that window is silently absorbed into the composer and the agent
-/// never sees the task at all — no error, no timeout signal, just a pane sitting
-/// idle with the instruction visible but unsent.
+/// Deliberately not `SystemTime`: that can step backwards (NTP correction, a DST
+/// change), which would make a target's last-output timestamp look arbitrarily
+/// far in the past. Quiet would then read as satisfied instantly and Enter would
+/// fire early — precisely the failure this module exists to prevent.
+static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn mono_ms() -> u64 {
+    CLOCK.elapsed().as_millis() as u64
+}
+
+/// How long a target's output must be quiet before we accept that it has
+/// finished receiving the prompt.
 ///
-/// So this delay must clear 120 ms with room for ConPTY delivery lag, and the
-/// cost of overshooting is nothing (a dispatch is a rare, human-scale event)
-/// while the cost of undershooting is a dispatch that fails silently. Claude
-/// Code and opencode submit correctly at any delay, so one generous value serves
-/// all three rather than a per-CLI table that would drift as they change.
-const SUBMIT_ENTER_DELAY_MS: u64 = 300;
+/// Sized against documented behaviour in the Codex TUI. Codex infers a paste
+/// from keystroke burst timing, and suppresses Enter for 120 ms afterwards —
+/// but it re-anchors that window on *every* buffered character, so the deadline
+/// keeps moving for as long as bytes are still arriving. An Enter that lands
+/// inside the window is absorbed into the composer as a newline, and the agent
+/// never sees the task: no error, no timeout signal, just a pane sitting idle
+/// with the instruction visible but unsent.
+///
+/// The previous fixed sleep measured from our own `write_all` returning, which
+/// is the wrong anchor — that only means the bytes reached the PTY buffer, not
+/// that the target consumed them. For a large payload ConPTY is still delivering
+/// well after the call returns, so a 1946-character dispatch reliably lost its
+/// Enter. Waiting for the target's *output* to stop instead measures the thing
+/// that actually matters, and adapts to payload size and machine load for free.
+/// 200 ms clears Codex's 120 ms window with room for delivery lag.
+const SUBMIT_QUIET_MS: u64 = 200;
+
+/// Never send Enter sooner than this after the write, however quiet the target
+/// looks. A CLI that renders nothing in response to input is "quiet" the instant
+/// we finish writing, which tells us nothing at all — this floor is what covers
+/// that case. It is also the delay the previous implementation used, so short
+/// prompts wait exactly as long as they did before and cannot regress.
+const SUBMIT_FLOOR_MS: u64 = 300;
+
+/// Give up waiting for quiet and send Enter regardless. An agent that is already
+/// mid-task streams output continuously and would never look quiet, so without a
+/// ceiling its dispatch would wait forever. This bounds the wait instead.
+const SUBMIT_CEILING_MS: u64 = 4000;
+
+/// How often to re-check for quiet while waiting.
+const SUBMIT_POLL_MS: u64 = 20;
+
+/// Whether the Enter that submits a prompt can be sent yet.
+///
+/// Split out from the waiting loop so the policy is testable without a live PTY:
+/// hold below the floor, then release as soon as the target goes quiet, and
+/// release unconditionally once the ceiling is reached.
+fn ready_to_submit(now: u64, started: u64, last_output: u64) -> bool {
+    let waited = now.saturating_sub(started);
+    if waited < SUBMIT_FLOOR_MS {
+        return false;
+    }
+    waited >= SUBMIT_CEILING_MS || now.saturating_sub(last_output) >= SUBMIT_QUIET_MS
+}
 
 #[derive(Default)]
 pub struct SessionManager {
@@ -81,17 +128,50 @@ impl SessionManager {
         false
     }
 
+    /// The session's output-activity clock, if it is still live.
+    fn output_clock(&self, id: &str) -> Option<Arc<AtomicU64>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|h| h.last_output.clone())
+    }
+
     /// Submit a prompt to a terminal UI as typing followed by a distinct Enter
     /// keypress. Codex and Claude Code deliberately distinguish pasted text
     /// containing a carriage return from an interactive Enter event; writing
     /// both in one PTY operation can leave the prompt sitting in the editor.
-    pub fn submit_to(&self, id: &str, prompt: &str) -> bool {
+    ///
+    /// The prompt is written synchronously, so an unreachable session is still
+    /// reported to the caller. The Enter is not: it waits for the target to stop
+    /// producing output (see `SUBMIT_QUIET_MS`) on a thread of its own, because
+    /// that wait is open-ended and dispatch is specifically documented to return
+    /// immediately so a conductor can fan work out. Blocking here would serialize
+    /// a fan-out into one round trip per target, which is the property dispatch
+    /// exists to provide.
+    ///
+    /// A `true` return therefore means "delivered to the terminal", not "already
+    /// submitted".
+    pub fn submit_to(self: &Arc<Self>, id: &str, prompt: &str) -> bool {
         if !self.write_to(id, prompt) {
             return false;
         }
+        // Captured before the wait so a session that dies mid-wait simply fails
+        // the final write rather than resurrecting a map entry.
+        let Some(clock) = self.output_clock(id) else {
+            return false;
+        };
 
-        thread::sleep(Duration::from_millis(SUBMIT_ENTER_DELAY_MS));
-        self.write_to(id, "\r")
+        let engine = self.clone();
+        let id = id.to_string();
+        thread::spawn(move || {
+            let started = mono_ms();
+            while !ready_to_submit(mono_ms(), started, clock.load(Ordering::Relaxed)) {
+                thread::sleep(Duration::from_millis(SUBMIT_POLL_MS));
+            }
+            engine.write_to(&id, "\r");
+        });
+        true
     }
 
     /// Ids of every live session.
@@ -332,6 +412,10 @@ async fn spawn_session(
     let mut args = args;
     args.extend(extra_args);
 
+    // Starts "active now" so a session that never writes anything is governed by
+    // SUBMIT_FLOOR_MS rather than looking quiet since the epoch.
+    let activity = Arc::new(AtomicU64::new(mono_ms()));
+
     // Create the PTY + child under the spawn lock (serialize ConPTY spawns). The
     // lock guard is confined to this block so it never crosses the .await below.
     let mut reader = {
@@ -363,6 +447,7 @@ async fn spawn_session(
                 writer,
                 child,
                 worktree: wt,
+                last_output: activity.clone(),
             },
         );
         reader
@@ -379,6 +464,10 @@ async fn spawn_session(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    // Stamped on arrival rather than after the send, which can
+                    // block on a full channel and would misreport the target as
+                    // quiet while it is in fact still talking.
+                    activity.store(mono_ms(), Ordering::Relaxed);
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
@@ -539,6 +628,56 @@ fn set_conductor(shared: State<'_, Arc<mcp::Shared>>, name: Option<String>) {
 #[tauri::command]
 fn halt_conductor(shared: State<'_, Arc<mcp::Shared>>, halted: bool) {
     shared.set_halted(halted);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ready_to_submit, SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS};
+
+    // A dispatch is only lost in one direction: an Enter sent too early is
+    // swallowed silently, while one sent late costs nothing but a pause. Every
+    // case below is therefore written from the "hold unless certain" side.
+
+    #[test]
+    fn holds_below_the_floor_even_when_the_target_is_silent() {
+        // Silent target, floor not yet reached. The old fixed delay is the floor,
+        // so this is also what stops short prompts regressing.
+        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, 0));
+    }
+
+    #[test]
+    fn submits_once_past_the_floor_and_the_target_has_gone_quiet() {
+        let now = SUBMIT_FLOOR_MS + SUBMIT_QUIET_MS;
+        let last_output = now - SUBMIT_QUIET_MS;
+        assert!(ready_to_submit(now, 0, last_output));
+    }
+
+    #[test]
+    fn holds_while_the_target_is_still_producing_output() {
+        // This is the 1946-character dispatch that failed: past the old 300 ms
+        // delay, but ConPTY is still delivering and Codex keeps re-anchoring its
+        // suppress window. The fixed-sleep implementation fired Enter here.
+        let now = SUBMIT_FLOOR_MS + 500;
+        let last_output = now - 10;
+        assert!(!ready_to_submit(now, 0, last_output));
+    }
+
+    #[test]
+    fn submits_at_the_ceiling_even_if_the_target_never_goes_quiet() {
+        // A target already mid-task streams output forever; the dispatch must
+        // still be delivered rather than waiting indefinitely.
+        let now = SUBMIT_CEILING_MS;
+        assert!(ready_to_submit(now, 0, now));
+    }
+
+    #[test]
+    fn quiet_is_measured_from_the_last_output_not_from_the_write() {
+        // Same elapsed wait in both cases; only the target's activity differs.
+        // That difference is the entire point of the change.
+        let now = SUBMIT_FLOOR_MS + 1000;
+        assert!(ready_to_submit(now, 0, now - SUBMIT_QUIET_MS));
+        assert!(!ready_to_submit(now, 0, now - (SUBMIT_QUIET_MS - 1)));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
