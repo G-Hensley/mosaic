@@ -149,7 +149,8 @@ button.ghost.on {
    Fit mode remains available for monitoring every pane at once. */
 .grid[data-layout="scroll"] {
   overflow-y: auto;
-  grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr));
+  scrollbar-color: var(--edge) var(--bg);
+  grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr));
   grid-auto-rows: minmax(420px, 1fr);
 }
 
@@ -191,6 +192,11 @@ button.ghost.on {
 
 .pane[data-status="exited"] {
   opacity: 0.72;
+}
+
+.pane:focus-within {
+  border-color: var(--acc);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--acc) 35%, transparent);
 }
 
 .pane-head {

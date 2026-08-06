@@ -61,9 +61,11 @@ Rust, and pnpm.
    dispatch immediately.
 5. **Layout: scroll** keeps every terminal at a comfortable minimum height and
    scrolls the cockpit. Switch to **Layout: fit** when you want every pane visible
-   at once. **Focus** expands one pane without stopping or remounting the others;
-   press **Escape** to restore the grid.
-6. **Ctrl+B** toggles the sidebar; **Ctrl+,** opens appearance settings.
+   at once. **Maximize** expands one pane without stopping or remounting the
+   others; use **Restore** to return to the grid.
+6. **Ctrl+Shift+B** toggles the sidebar; **Ctrl+Shift+,** opens appearance
+   settings; **Ctrl+Shift+K** opens the session launcher. The Shift modifier
+   keeps common terminal controls such as Ctrl+B and Ctrl+K available to agents.
 
 ## How agents connect
 

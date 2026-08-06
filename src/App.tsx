@@ -181,25 +181,27 @@ function App() {
     handleDropOnBrain(brain, e.dataTransfer.getData("text/plain"));
   }
 
-  // ⌘K launcher · ⌘, appearance · ⌘B sidebar.
+  // Capture app shortcuts before xterm sees them. Plain Ctrl+K/Ctrl+B belong
+  // to terminal applications, so Mosaic uses Ctrl+Shift chords instead.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key.toLowerCase() === "k") {
+      if (mod && e.shiftKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
+        e.stopPropagation();
         setLauncherOpen((o) => !o);
-      } else if (mod && e.key === ",") {
+      } else if (mod && e.shiftKey && e.key === ",") {
         e.preventDefault();
+        e.stopPropagation();
         setSettingsOpen((o) => !o);
-      } else if (mod && e.key.toLowerCase() === "b") {
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === "b") {
         e.preventDefault();
+        e.stopPropagation();
         setSidebarOpen((o) => !o);
-      } else if (e.key === "Escape") {
-        setFocusedPane(null);
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, []);
 
   // Same-brain panes cluster together; order is stable so drags don't remount.
@@ -230,7 +232,7 @@ function App() {
         <button
           className={"ghost" + (sidebarOpen ? " on" : "")}
           onClick={() => setSidebarOpen((o) => !o)}
-          title="Shared brain (⌘B)"
+          title="Shared brain (Ctrl+Shift+B)"
         >
           Shared brain
         </button>
@@ -245,11 +247,15 @@ function App() {
         >
           Layout: {layout === "scroll" ? "scroll" : "fit"}
         </button>
-        <button className="ghost" onClick={() => setSettingsOpen(true)} title="Appearance (⌘,)">
+        <button
+          className="ghost"
+          onClick={() => setSettingsOpen(true)}
+          title="Appearance (Ctrl+Shift+,)"
+        >
           Appearance
         </button>
         <button className="primary" onClick={() => setLauncherOpen(true)}>
-          + New session <kbd>⌘K</kbd>
+          + New session <kbd>Ctrl Shift K</kbd>
         </button>
       </header>
 
@@ -272,7 +278,7 @@ function App() {
                 other or a brain in the sidebar — to share context.
               </div>
               <button className="primary" onClick={() => setLauncherOpen(true)}>
-                + New session <kbd>⌘K</kbd>
+                + New session <kbd>Ctrl Shift K</kbd>
               </button>
             </div>
           ) : (
@@ -325,11 +331,11 @@ function App() {
                     </button>
                     <button
                       className={"pane-focus" + (focusedPane === p.id ? " on" : "")}
-                      title={focusedPane === p.id ? "Show all panes (Esc)" : "Focus this pane"}
+                      title={focusedPane === p.id ? "Show all panes" : "Maximize this pane"}
                       aria-pressed={focusedPane === p.id}
                       onClick={() => setFocusedPane((current) => (current === p.id ? null : p.id))}
                     >
-                      {focusedPane === p.id ? "Restore" : "Focus"}
+                      {focusedPane === p.id ? "Restore" : "Maximize"}
                     </button>
                     <button className="pane-x" title="Close session" onClick={() => closePane(p.id)}>
                       ✕

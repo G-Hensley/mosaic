@@ -70,6 +70,7 @@ export function TerminalPane({
       const last = lastSizeRef.current;
       if (term.rows === last.rows && term.cols === last.cols) return;
       lastSizeRef.current = { rows: term.rows, cols: term.cols };
+      term.refresh(0, term.rows - 1);
       resizeSession(sessionId, term.rows, term.cols).catch(() => {});
     };
     const scheduleFit = () => {
@@ -102,7 +103,28 @@ export function TerminalPane({
     });
 
     const channel = new Channel<Bytes>();
-    channel.onmessage = (msg) => term.write(toBytes(msg));
+    const outputQueue: Uint8Array[] = [];
+    let outputFrame: number | null = null;
+    const flushOutput = () => {
+      outputFrame = null;
+      if (outputQueue.length === 0) return;
+      if (outputQueue.length === 1) {
+        term.write(outputQueue.shift()!);
+        return;
+      }
+      const total = outputQueue.reduce((n, chunk) => n + chunk.byteLength, 0);
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of outputQueue.splice(0)) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      term.write(merged);
+    };
+    channel.onmessage = (msg) => {
+      outputQueue.push(toBytes(msg));
+      if (outputFrame === null) outputFrame = requestAnimationFrame(flushOutput);
+    };
 
     const ro = new ResizeObserver(scheduleFit);
     ro.observe(elRef.current!);
@@ -127,6 +149,7 @@ export function TerminalPane({
     return () => {
       ro.disconnect();
       if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
       scheduleFitRef.current = () => {};
       unlisten.then((f) => f());
       term.dispose();
