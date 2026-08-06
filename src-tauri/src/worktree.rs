@@ -44,11 +44,9 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Where worktrees are kept — outside any repo.
+/// Where worktrees are kept — outside any repo, and outside the install dir.
 fn base_dir() -> PathBuf {
-    let root = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-    PathBuf::from(root).join("mosaic").join("worktrees")
+    crate::app_data_dir().join("worktrees")
 }
 
 /// Create an isolated worktree + branch for a session. The branch carries a short

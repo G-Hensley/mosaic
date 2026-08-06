@@ -124,11 +124,22 @@ fn build_command(
     cmd
 }
 
-/// Per-session scratch dir for the config files we hand an agent CLI at launch.
-fn session_config_dir(session_id: &str) -> PathBuf {
+/// Root for everything Mosaic stores per machine: worktrees, per-session agent
+/// config, and the fallback context dir.
+///
+/// Keyed by bundle identifier rather than product name on purpose. A per-user
+/// install puts the app itself in `%LOCALAPPDATA%\Mosaic`, and Windows paths are
+/// case-insensitive — so a plain "mosaic" here would mix runtime data in with
+/// the installed binaries, and an uninstall could take an agent's worktree with it.
+pub fn app_data_dir() -> PathBuf {
     let root = std::env::var("LOCALAPPDATA")
         .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-    PathBuf::from(root).join("mosaic").join("sessions").join(session_id)
+    PathBuf::from(root).join("com.gavinhensley.mosaic")
+}
+
+/// Per-session scratch dir for the config files we hand an agent CLI at launch.
+fn session_config_dir(session_id: &str) -> PathBuf {
+    app_data_dir().join("sessions").join(session_id)
 }
 
 /// Point ONE agent CLI at ONE dedicated MCP endpoint, entirely through launch
@@ -393,9 +404,7 @@ fn kill_session(state: State<'_, Arc<SessionManager>>, session_id: String) {
 /// Where the shared brain writes its markdown before a project is chosen.
 /// App-local, so it is never at the mercy of the launch directory.
 fn default_context_dir() -> PathBuf {
-    let root = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-    PathBuf::from(root).join("mosaic").join("context")
+    app_data_dir().join("context")
 }
 
 /// Point the shared brain's markdown at the project the user picked, so a
