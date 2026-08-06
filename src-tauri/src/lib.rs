@@ -340,14 +340,17 @@ async fn spawn_session(
     };
 
     // Blocking reads on their own thread → async forward loop via mpsc.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // Bound each session's pending output to roughly 512 KiB. Backpressure here
+    // is preferable to six unbounded queues consuming memory when WebView2 is
+    // busy or minimized; ConPTY naturally blocks the child until we catch up.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -355,7 +358,16 @@ async fn spawn_session(
         }
     });
 
-    while let Some(bytes) = rx.recv().await {
+    while let Some(mut bytes) = rx.recv().await {
+        // Drain queued bursts into fewer IPC messages without adding latency to
+        // interactive output. Keep batches modest so one noisy agent cannot
+        // monopolize the WebView event loop.
+        while bytes.len() < 64 * 1024 {
+            match rx.try_recv() {
+                Ok(next) => bytes.extend_from_slice(&next),
+                Err(_) => break,
+            }
+        }
         if channel.send(&bytes[..]).is_err() {
             break;
         }

@@ -60,12 +60,15 @@ Rust, and pnpm.
    target's visible terminal, so you see every instruction. **Stop** halts all
    dispatch immediately.
 5. **Layout: scroll** keeps every terminal at a comfortable minimum height and
-   scrolls the cockpit. Switch to **Layout: fit** when you want every pane visible
-   at once. **Maximize** expands one pane without stopping or remounting the
-   others; use **Restore** to return to the grid.
+   scrolls the cockpit. Open **Layout** to choose automatic or fixed 1–4 column
+   arrangements and a minimum pane height, or switch to **Fit window** when you
+   want every pane visible at once. **Maximize** expands one pane without stopping
+   or remounting the others; use **Restore** to return to the grid.
 6. **Ctrl+Shift+B** toggles the sidebar; **Ctrl+Shift+,** opens appearance
    settings; **Ctrl+Shift+K** opens the session launcher. The Shift modifier
    keeps common terminal controls such as Ctrl+B and Ctrl+K available to agents.
+   **Ctrl+Shift+1…9** focuses a session; **Ctrl+Shift+Enter** maximizes or restores
+   the active terminal.
 
 ## How agents connect
 

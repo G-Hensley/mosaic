@@ -19,6 +19,7 @@ src-tauri/icons/ios/
 
 # Alternate release output used when the normal executable is running.
 src-tauri/target-ui-layout/
+src-tauri/target-ui-v2/
 
 # Shared-brain runtime data. Written into whichever project is active; when that
 # project is Mosaic itself, it's just scratch from a test run.

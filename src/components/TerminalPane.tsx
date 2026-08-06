@@ -56,6 +56,20 @@ export function TerminalPane({
     termRef.current = term;
     fitRef.current = fit;
 
+    let resizeInFlight = false;
+    let desiredSize: { rows: number; cols: number } | null = null;
+    let alive = true;
+    const pumpResize = async () => {
+      if (resizeInFlight) return;
+      resizeInFlight = true;
+      while (alive && desiredSize) {
+        const next = desiredSize;
+        desiredSize = null;
+        await resizeSession(sessionId, next.rows, next.cols).catch(() => {});
+      }
+      resizeInFlight = false;
+    };
+
     const fitAndResize = () => {
       fitFrameRef.current = null;
       const el = elRef.current;
@@ -70,8 +84,8 @@ export function TerminalPane({
       const last = lastSizeRef.current;
       if (term.rows === last.rows && term.cols === last.cols) return;
       lastSizeRef.current = { rows: term.rows, cols: term.cols };
-      term.refresh(0, term.rows - 1);
-      resizeSession(sessionId, term.rows, term.cols).catch(() => {});
+      desiredSize = { rows: term.rows, cols: term.cols };
+      void pumpResize();
     };
     const scheduleFit = () => {
       if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
@@ -104,10 +118,12 @@ export function TerminalPane({
 
     const channel = new Channel<Bytes>();
     const outputQueue: Uint8Array[] = [];
+    let outputBytes = 0;
     let outputFrame: number | null = null;
     const flushOutput = () => {
       outputFrame = null;
       if (outputQueue.length === 0) return;
+      outputBytes = 0;
       if (outputQueue.length === 1) {
         term.write(outputQueue.shift()!);
         return;
@@ -122,8 +138,20 @@ export function TerminalPane({
       term.write(merged);
     };
     channel.onmessage = (msg) => {
-      outputQueue.push(toBytes(msg));
-      if (outputFrame === null) outputFrame = requestAnimationFrame(flushOutput);
+      const bytes = toBytes(msg);
+      outputQueue.push(bytes);
+      outputBytes += bytes.byteLength;
+      if (outputBytes >= 64 * 1024) {
+        if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+        flushOutput();
+      } else if (outputFrame === null) {
+        outputFrame = requestAnimationFrame(flushOutput);
+      }
+    };
+    const writeAfterQueuedOutput = (data: string) => {
+      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      flushOutput();
+      term.write(data);
     };
 
     const ro = new ResizeObserver(scheduleFit);
@@ -135,11 +163,11 @@ export function TerminalPane({
     spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
       isolate,
       cwd,
-    }).catch((e) => term.write(`\r\n\x1b[31m[spawn error] ${e}\x1b[0m\r\n`));
+    }).catch((e) => writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${e}\x1b[0m\r\n`));
 
     const unlisten = listen<string>("session-exited", (ev) => {
       if (ev.payload === sessionId) {
-        term.write("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
+        writeAfterQueuedOutput("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
         onExit(sessionId);
       }
     });
@@ -147,6 +175,8 @@ export function TerminalPane({
     term.focus();
 
     return () => {
+      alive = false;
+      desiredSize = null;
       ro.disconnect();
       if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
       if (outputFrame !== null) cancelAnimationFrame(outputFrame);

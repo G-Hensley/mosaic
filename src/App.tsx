@@ -7,6 +7,11 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { ContextSidebar } from "./components/ContextSidebar";
 import { ConductorBar } from "./components/ConductorBar";
 import {
+  LayoutPanel,
+  type LayoutColumns,
+  type LayoutMode,
+} from "./components/LayoutPanel";
+import {
   killSession,
   setAgentBrain,
   conductorState,
@@ -18,7 +23,6 @@ import { brainColorMap } from "./lib/brains";
 import "./App.css";
 
 type PaneStatus = "running" | "exited";
-type LayoutMode = "scroll" | "fit";
 type Pane = {
   id: string;
   type: SessionType;
@@ -31,6 +35,7 @@ function App() {
   const [panes, setPanes] = useState<Pane[]>([]);
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [layoutOpen, setLayoutOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [layout, setLayout] = useState<LayoutMode>(() => {
     try {
@@ -40,6 +45,24 @@ function App() {
     }
   });
   const [focusedPane, setFocusedPane] = useState<string | null>(null);
+  const [layoutColumns, setLayoutColumns] = useState<LayoutColumns>(() => {
+    try {
+      const value = localStorage.getItem("mosaic.layout.columns");
+      return /^[1-6]$/.test(value ?? "")
+        ? (Number(value) as LayoutColumns)
+        : "auto";
+    } catch {
+      return "auto";
+    }
+  });
+  const [paneHeight, setPaneHeight] = useState(() => {
+    try {
+      const value = Number(localStorage.getItem("mosaic.layout.paneHeight"));
+      return value >= 280 && value <= 720 ? value : 420;
+    } catch {
+      return 420;
+    }
+  });
   const [selectedBrain, setSelectedBrain] = useState("main");
   // The git repo sessions run in. Isolated sessions get worktrees of it.
   const [project, setProject] = useState<string | null>(() => {
@@ -124,17 +147,15 @@ function App() {
     setFocusedPane((focused) => (focused === id ? null : focused));
   }
 
-  function toggleLayout() {
-    setLayout((current) => {
-      const next = current === "scroll" ? "fit" : "scroll";
-      try {
-        localStorage.setItem("mosaic.layout", next);
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  }
+  useEffect(() => {
+    try {
+      localStorage.setItem("mosaic.layout", layout);
+      localStorage.setItem("mosaic.layout.columns", String(layoutColumns));
+      localStorage.setItem("mosaic.layout.paneHeight", String(paneHeight));
+    } catch {
+      /* ignore */
+    }
+  }, [layout, layoutColumns, paneHeight]);
 
   function markExited(id: string) {
     setPanes((p) => p.map((x) => (x.id === id ? { ...x, status: "exited" } : x)));
@@ -184,6 +205,17 @@ function App() {
   // Capture app shortcuts before xterm sees them. Plain Ctrl+K/Ctrl+B belong
   // to terminal applications, so Mosaic uses Ctrl+Shift chords instead.
   useEffect(() => {
+    const focusPaneAt = (index: number) => {
+      const pane = document.querySelectorAll<HTMLElement>(".pane")[index];
+      if (!pane) return;
+      const id = pane.dataset.paneId;
+      if (id) setFocusedPane((current) => (current && current !== id ? null : current));
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() =>
+          pane.querySelector<HTMLElement>(".xterm-helper-textarea")?.focus(),
+        ),
+      );
+    };
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.shiftKey && e.key.toLowerCase() === "k") {
@@ -198,6 +230,17 @@ function App() {
         e.preventDefault();
         e.stopPropagation();
         setSidebarOpen((o) => !o);
+      } else if (mod && e.shiftKey && /^[1-9]$/.test(e.key)) {
+        e.preventDefault();
+        e.stopPropagation();
+        focusPaneAt(Number(e.key) - 1);
+      } else if (mod && e.shiftKey && e.key === "Enter") {
+        const pane = document.activeElement?.closest<HTMLElement>(".pane");
+        const id = pane?.dataset.paneId;
+        if (!id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setFocusedPane((current) => (current === id ? null : id));
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -238,14 +281,10 @@ function App() {
         </button>
         <button
           className={"ghost" + (layout === "scroll" ? " on" : "")}
-          onClick={toggleLayout}
-          title={
-            layout === "scroll"
-              ? "Scrollable comfortable panes — click to fit all"
-              : "Fit every pane on screen — click for comfortable scrolling"
-          }
+          onClick={() => setLayoutOpen(true)}
+          title="Customize terminal layout"
         >
-          Layout: {layout === "scroll" ? "scroll" : "fit"}
+          Layout: {layoutColumns === "auto" ? "auto" : `${layoutColumns} col`}
         </button>
         <button
           className="ghost"
@@ -264,11 +303,34 @@ function App() {
       )}
 
       <div className="body">
+        {focusedPane && (
+          <nav className="spotlight-rail" aria-label="Live sessions">
+            {ordered.map((p, index) => (
+              <button
+                key={p.id}
+                className={"spotlight-item" + (focusedPane === p.id ? " active" : "")}
+                onClick={() => setFocusedPane(p.id)}
+                title={`Switch to ${p.type.label} ${p.id} (Ctrl+Shift+${index + 1})`}
+              >
+                <span className="dot" style={{ background: p.type.color }} />
+                <span>{p.type.label}</span>
+                <small>{index + 1}</small>
+              </button>
+            ))}
+          </nav>
+        )}
         <main
           className="grid"
           data-count={count}
           data-layout={layout}
+          data-columns={layoutColumns}
           data-focused={focusedPane !== null}
+          style={
+            {
+              "--layout-columns": layoutColumns === "auto" ? 1 : layoutColumns,
+              "--pane-min-height": `${paneHeight}px`,
+            } as CSSProperties
+          }
         >
           {panes.length === 0 ? (
             <div className="empty">
@@ -292,6 +354,7 @@ function App() {
                     (focusedPane === p.id ? " focused" : "")
                   }
                   key={p.id}
+                  data-pane-id={p.id}
                   data-status={p.status}
                   style={grouped ? ({ "--brain": color } as CSSProperties) : undefined}
                   onDragOver={allowDrop}
@@ -372,6 +435,17 @@ function App() {
         <SessionLauncher onPick={addSession} onClose={() => setLauncherOpen(false)} />
       )}
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {layoutOpen && (
+        <LayoutPanel
+          mode={layout}
+          columns={layoutColumns}
+          paneHeight={paneHeight}
+          onMode={setLayout}
+          onColumns={setLayoutColumns}
+          onPaneHeight={setPaneHeight}
+          onClose={() => setLayoutOpen(false)}
+        />
+      )}
     </div>
   );
 }
