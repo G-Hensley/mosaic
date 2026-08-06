@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mosaic — Appearance settings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:#070709;color:#e6e6e6;font-family:"Inter",system-ui,sans-serif;-webkit-font-smoothing:antialiased;line-height:1.5}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;text-align:left}
+:focus-visible{outline:2px solid #7aa2ff;outline-offset:2px}
+.page{max-width:1320px;margin:0 auto;padding:22px}
+.lead{margin:0 2px 16px}
+.lead h1{font-family:"Bricolage Grotesque",sans-serif;font-size:20px;font-weight:700;letter-spacing:-.01em}
+.lead p{color:#7d828c;font-size:13px;margin-top:3px}
+.lead p b{color:#aab0ba;font-weight:600}
+
+/* ---------- app window shell (neutral chrome) ---------- */
+.win{border:1px solid #1c1e25;border-radius:14px;overflow:hidden;background:#0c0d11;box-shadow:0 26px 70px -28px rgba(0,0,0,.7)}
+.titlebar{display:flex;align-items:center;gap:12px;padding:11px 15px;border-bottom:1px solid #1a1c22;background:#0d0e13}
+.titlebar .dots{display:flex;gap:7px}
+.titlebar .dots i{width:11px;height:11px;border-radius:50%;display:block}
+.titlebar .dots i:nth-child(1){background:#e8785a}.titlebar .dots i:nth-child(2){background:#f0a868}.titlebar .dots i:nth-child(3){background:#7cc98a}
+.titlebar .t{font-size:12px;color:#8b909a;letter-spacing:.02em}
+.titlebar .t b{color:#cfd3da;font-weight:600}
+.titlebar .esc{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:10.5px;color:#5b616b;border:1px solid #23262d;border-radius:6px;padding:3px 8px}
+
+.sbody{display:grid;grid-template-columns:186px 336px 1fr;min-height:560px}
+.nav{border-right:1px solid #17191f;padding:14px 10px;background:#0b0c10}
+.nav .grp{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#565b64;padding:6px 10px 8px}
+.nav a{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;font-size:13px;color:#9aa0aa;text-decoration:none}
+.nav a .i{width:15px;text-align:center;opacity:.8}
+.nav a.on{background:#15171d;color:#f0f2f5}
+.nav a:hover:not(.on){background:#101217;color:#c8ccd3}
+
+.ctrl{border-right:1px solid #17191f;padding:18px 18px 24px;overflow:auto}
+.ctrl h2{font-family:"Bricolage Grotesque",sans-serif;font-size:16px;font-weight:700;margin-bottom:2px}
+.ctrl .sub{color:#7d828c;font-size:12px;margin-bottom:16px}
+.seclabel{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#6b7079;margin:18px 2px 10px;display:flex;align-items:center;gap:8px}
+.seclabel:first-of-type{margin-top:4px}
+.seclabel .cnt{color:#4f545c;font-weight:400;letter-spacing:0;text-transform:none;font-size:11px}
+
+.tgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tcard{border:1px solid #23262d;border-radius:11px;padding:8px;background:#101216;transition:.14s;cursor:pointer}
+.tcard:hover{border-color:#343943;background:#12141a}
+.tcard.on{border-color:transparent}
+.tprev{height:50px;border-radius:7px;position:relative;overflow:hidden;border:1px solid rgba(255,255,255,.05)}
+.tprev .bar{position:absolute;top:0;left:0;right:0;height:11px;background:rgba(255,255,255,.06)}
+.tprev .bar i{position:absolute;top:4px;width:4px;height:4px;border-radius:50%;background:rgba(255,255,255,.35)}
+.tprev .bar i:nth-child(1){left:6px}.tprev .bar i:nth-child(2){left:13px}.tprev .bar i:nth-child(3){left:20px}
+.tprev .dts{position:absolute;left:8px;bottom:8px;display:flex;gap:5px}
+.tprev .dts i{width:10px;height:10px;border-radius:50%;display:block}
+.tprev .ln{position:absolute;right:8px;bottom:9px;width:36px;height:6px;border-radius:3px;opacity:.9}
+.tmeta{display:flex;align-items:center;gap:7px;margin-top:8px}
+.tmeta .nm{font-size:12.5px;font-weight:600;color:#dfe2e7}
+.tmeta .tag{margin-left:auto;font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:#6a6f78;border:1px solid #262a31;border-radius:20px;padding:1px 7px}
+.tmeta .ck{width:15px;height:15px;border-radius:50%;display:none;place-items:center;color:#0c0d11;font-size:10px;font-weight:800}
+.tcard.on .ck{display:grid}
+
+.optrow{display:flex;align-items:center;gap:12px;padding:11px 2px;border-bottom:1px solid #16181e}
+.optrow .txt{font-size:13px;color:#d4d8de}
+.optrow .txt small{display:block;color:#71767f;font-size:11.5px;margin-top:1px}
+.optrow .ctl{margin-left:auto}
+.toggle{width:38px;height:22px;border-radius:999px;background:#23262d;position:relative;transition:.16s;flex:none}
+.toggle::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#0c0d11;transition:.16s}
+.toggle.on{background:#5b8cff}
+.toggle.on::after{left:18px;background:#fff}
+.seg{display:flex;border:1px solid #23262d;border-radius:8px;overflow:hidden}
+.seg button{padding:5px 11px;font-size:12px;color:#9aa0aa}
+.seg button.on{background:#1b1e25;color:#eef0f3}
+.note{color:#5f646d;font-size:11px;margin-top:12px;font-style:italic}
+
+/* ---------- live preview column ---------- */
+.pv{padding:18px;display:flex;flex-direction:column;gap:12px;background:#08090c}
+.pvh{display:flex;align-items:center;gap:9px;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#6b7079}
+.pvh .live{display:flex;align-items:center;gap:6px;color:#7cc98a}
+.pvh .live i{width:7px;height:7px;border-radius:50%;background:#7cc98a;box-shadow:0 0 8px #7cc98a}
+.pvh .now{margin-left:auto;font-family:"JetBrains Mono",monospace;color:#8b909a;letter-spacing:0;text-transform:none}
+
+/* ======= tokenized Atelier preview ======= */
+.atelier{border-radius:14px;overflow:hidden;border:1px solid var(--edge);background:radial-gradient(700px 420px at 82% -10%,var(--bg2) 0,var(--bg) 58%);color:var(--txt);font-family:"Inter",sans-serif;box-shadow:0 20px 44px -22px rgba(0,0,0,.6);transition:background .35s ease,color .3s ease;--shadow:rgba(0,0,0,.8);--chip:rgba(0,0,0,.25)}
+.atelier .term{font-family:"JetBrains Mono",monospace;font-size:var(--tfs,11.5px);line-height:1.62;white-space:pre-wrap;word-break:break-word}
+.atelier .term .p{color:var(--ok)}.atelier .term .ok{color:var(--ok)}.atelier .term .cor{color:var(--acc2)}.atelier .term .am{color:var(--acc)}.atelier .term .cmt{color:var(--cmt);font-style:italic}.atelier .term .dim{color:var(--dim)}.atelier .term .code{color:var(--code)}
+.atelier .cur{display:inline-block;width:7px;height:13px;vertical-align:-2px;background:currentColor;animation:blink 1.1s step-end infinite}
+@keyframes blink{50%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.atelier .cur{animation:none}.atelier{transition:none}}
+.atelier .abar{display:flex;align-items:center;gap:12px;padding:12px 15px}
+.atelier .dots{display:flex;gap:6px}.atelier .dots i{width:10px;height:10px;border-radius:50%;display:block}
+.atelier .dots i:nth-child(1){background:var(--acc2)}.atelier .dots i:nth-child(2){background:var(--acc)}.atelier .dots i:nth-child(3){background:var(--dim)}
+.atelier .awrk{font-family:"Bricolage Grotesque",sans-serif;font-weight:600;font-size:14px;letter-spacing:-.01em}
+.atelier .awrk em{font-style:normal;color:var(--dim);font-weight:400}
+.atelier .akbd{margin-left:auto;display:flex;align-items:center;gap:7px;padding:6px 11px;border-radius:9px;background:var(--chip);border:1px solid var(--edge);color:var(--dim);font-size:12px}
+.atelier .akbd kbd{font-family:"JetBrains Mono",monospace;font-size:10.5px;background:var(--panel2);border:1px solid var(--edge);border-radius:5px;padding:1px 5px;color:var(--txt)}
+.atelier .astage{position:relative;padding:4px 15px 16px}
+.atelier .cards{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.atelier .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--edge);border-radius:14px;overflow:hidden;box-shadow:0 14px 32px -22px var(--shadow)}
+.atelier .card .ch{display:flex;align-items:center;gap:9px;padding:11px 13px}
+.atelier .card .av{width:20px;height:20px;border-radius:6px;display:grid;place-items:center;font-family:"JetBrains Mono",monospace;font-size:10px;font-weight:700;color:var(--acc-ink)}
+.atelier .card.claude .av{background:var(--claude)}.atelier .card.codex .av{background:var(--codex)}.atelier .card.oc .av{background:var(--oc)}.atelier .card.cond .av{background:var(--acc)}
+.atelier .card .nm{font-family:"Bricolage Grotesque",sans-serif;font-weight:600;font-size:13px}
+.atelier .card .nm em{font-style:normal;color:var(--dim);font-weight:400;font-size:12px}
+.atelier .card .br{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--dim);background:var(--chip);border:1px solid var(--edge);border-radius:20px;padding:2px 9px}
+.atelier .card .cb{padding:2px 14px 14px}
+.atelier .palette{position:absolute;left:50%;top:6px;transform:translateX(-50%);width:min(500px,92%);background:var(--panel2);border:1px solid var(--edge);border-radius:14px;box-shadow:0 24px 60px -18px var(--shadow);overflow:hidden;z-index:5}
+.atelier .palette .pq{display:flex;align-items:center;gap:11px;padding:13px 16px;border-bottom:1px solid var(--edge);font-size:14px;color:var(--txt)}
+.atelier .palette .pq .mag{color:var(--acc);font-size:14px}
+.atelier .palette .pq .car{width:2px;height:16px;background:var(--acc);animation:blink 1.1s step-end infinite}
+.atelier .palette .prow{display:flex;align-items:center;gap:11px;padding:10px 16px;font-size:12.5px}
+.atelier .palette .prow.sel{background:color-mix(in srgb,var(--acc) 14%,transparent)}
+.atelier .palette .prow .ic{width:22px;height:22px;border-radius:6px;background:var(--chip);display:grid;place-items:center;color:var(--acc);font-size:11px;flex:none}
+.atelier .palette .prow .sc{margin-left:auto;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--dim)}
+.atelier .palette .prow small{color:var(--dim);font-size:11px}
+.atelier .palette .prow b{color:var(--txt)}
+.atelier .dock{margin:14px auto 0;width:max-content;max-width:100%;display:flex;align-items:center;gap:12px;padding:9px 11px 9px 15px;background:var(--panel2);border:1px solid var(--edge);border-radius:999px;box-shadow:0 14px 32px -18px var(--shadow)}
+.atelier .dock .cd{display:flex;align-items:center;gap:8px;font-size:12.5px}
+.atelier .dock .cd .rec{width:8px;height:8px;border-radius:50%;background:var(--acc);box-shadow:0 0 10px var(--acc)}
+.atelier .dock .cd b{font-family:"Bricolage Grotesque",sans-serif}
+.atelier .dock .cd small{color:var(--dim)}
+.atelier .dock .stop{display:flex;align-items:center;gap:7px;padding:7px 14px;border-radius:999px;background:var(--acc2);color:var(--acc-ink);font-weight:700;font-size:12px}
+
+/* ---------------------- THEME TOKENS ---------------------- */
+.atelier[data-scheme="tokyo-night"]{--bg:#1a1b26;--bg2:#1f2335;--panel:#1f2335;--panel2:#24283b;--edge:#2c3049;--txt:#c0caf5;--dim:#565f89;--acc:#7aa2f7;--acc2:#f7768e;--acc-ink:#1a1b26;--claude:#f7768e;--codex:#9ece6a;--oc:#bb9af7;--code:#7dcfff;--ok:#9ece6a;--cmt:#565f89}
+.atelier[data-scheme="synthwave"]{--bg:#241b2f;--bg2:#2a2139;--panel:#2a2139;--panel2:#342a4d;--edge:#463a66;--txt:#f6f4fb;--dim:#7e7aa8;--acc:#ff7edb;--acc2:#fe4450;--acc-ink:#241b2f;--claude:#fe4450;--codex:#72f1b8;--oc:#c792ea;--code:#36f9f6;--ok:#72f1b8;--cmt:#848bbd;--chip:rgba(255,255,255,.05)}
+.atelier[data-scheme="ember"]{--bg:#14110d;--bg2:#241d14;--panel:#1d1812;--panel2:#231d16;--edge:#2c251c;--txt:#ece4d8;--dim:#9a8d7c;--acc:#f0a868;--acc2:#e8785a;--acc-ink:#1a120b;--claude:#e8785a;--codex:#7cc98a;--oc:#b79ce0;--code:#9ec3f0;--ok:#7cc98a;--cmt:#8a7d6a}
+.atelier[data-scheme="slate"]{--bg:#0e1116;--bg2:#171d27;--panel:#161a21;--panel2:#1b2028;--edge:#262c36;--txt:#dce3ec;--dim:#828c9c;--acc:#8aa2ff;--acc2:#f0997a;--acc-ink:#0e1116;--claude:#e8896a;--codex:#7fd0a0;--oc:#a99bf0;--code:#9ec3f0;--ok:#7fd0a0;--cmt:#5f6a7a}
+.atelier[data-scheme="rose"]{--bg:#191724;--bg2:#211d33;--panel:#1f1d2e;--panel2:#26233a;--edge:#332f4a;--txt:#e0def4;--dim:#908caa;--acc:#f6c177;--acc2:#eb6f92;--acc-ink:#191724;--claude:#eb6f92;--codex:#9ccfd8;--oc:#c4a7e7;--code:#9ccfd8;--ok:#9ccfd8;--cmt:#6e6a86}
+.atelier[data-scheme="nord"]{--bg:#242933;--bg2:#2e3440;--panel:#2e3440;--panel2:#353d4b;--edge:#3b4252;--txt:#e5e9f0;--dim:#7b8394;--acc:#88c0d0;--acc2:#d08770;--acc-ink:#242933;--claude:#d08770;--codex:#a3be8c;--oc:#b48ead;--code:#8fbcbb;--ok:#a3be8c;--cmt:#616e88}
+.atelier[data-scheme="everforest"]{--bg:#272e33;--bg2:#2d353b;--panel:#2d353b;--panel2:#343f44;--edge:#3d484d;--txt:#d3c6aa;--dim:#859289;--acc:#a7c080;--acc2:#e69875;--acc-ink:#232a2e;--claude:#e69875;--codex:#a7c080;--oc:#d699b6;--code:#7fbbb3;--ok:#83c092;--cmt:#7a8478}
+.atelier[data-scheme="paper"]{--bg:#f4efe6;--bg2:#efe7d9;--panel:#fbf8f1;--panel2:#f4eee2;--edge:#e4dac8;--txt:#3a3226;--dim:#8a7f6d;--acc:#c8842b;--acc2:#c25a3f;--acc-ink:#fbf8f1;--claude:#b8543a;--codex:#4e8a5a;--oc:#7a5bb0;--code:#2f6ab0;--ok:#4e8a5a;--cmt:#9a8f7c;--shadow:rgba(120,100,70,.28);--chip:rgba(0,0,0,.05)}
+
+/* SynthWave '84 neon glow (only when enabled) */
+.atelier.glow[data-scheme="synthwave"] .term .p,.atelier.glow[data-scheme="synthwave"] .term .ok,.atelier.glow[data-scheme="synthwave"] .term .am,.atelier.glow[data-scheme="synthwave"] .term .cor,.atelier.glow[data-scheme="synthwave"] .term .code{text-shadow:0 0 6px currentColor}
+.atelier.glow[data-scheme="synthwave"] .card .nm,.atelier.glow[data-scheme="synthwave"] .awrk,.atelier.glow[data-scheme="synthwave"] .palette .pq{text-shadow:0 0 8px rgba(255,126,219,.45)}
+.atelier.glow[data-scheme="synthwave"] .dock .stop{box-shadow:0 0 20px var(--acc2)}
+.atelier.glow[data-scheme="synthwave"] .dock .cd .rec{box-shadow:0 0 12px var(--acc)}
+.atelier.glow[data-scheme="synthwave"] .palette .pq .mag,.atelier.glow[data-scheme="synthwave"] .palette .pq .car{filter:drop-shadow(0 0 6px var(--acc))}
+.atelier.glow[data-scheme="synthwave"] .card .av{box-shadow:0 0 12px color-mix(in srgb,var(--claude) 60%,transparent)}
+
+/* option effects (density / consistent agent colors) */
+.atelier.compact .term{line-height:1.45}
+.atelier.compact .card .cb{padding-bottom:9px}
+.atelier.compact .card .ch{padding-top:9px;padding-bottom:9px}
+.atelier.fixed-agents{--claude:#e8785a;--codex:#7cc98a;--oc:#b79ce0}
+
+@media (max-width:1020px){.sbody{grid-template-columns:1fr}.nav{display:none}.ctrl{border-right:none;border-bottom:1px solid #17191f}.atelier .cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="lead">
+    <h1>Appearance — theme system</h1>
+    <p>This is a mock of the app's <b>Settings → Appearance</b> panel. Click any theme (or press <b>1–8</b>) — the preview on the right recolors live. <b>Tokyo Night</b> and <b>SynthWave '84</b> ship built-in; flip the <b>Neon glow</b> option with SynthWave selected.</p>
+  </div>
+
+  <div class="win">
+    <div class="titlebar">
+      <div class="dots"><i></i><i></i><i></i></div>
+      <div class="t">mosaic · <b>Settings</b></div>
+      <div class="esc">Esc to close</div>
+    </div>
+    <div class="sbody">
+      <nav class="nav">
+        <div class="grp">Settings</div>
+        <a href="#"><span class="i">◍</span>General</a>
+        <a href="#" class="on"><span class="i">◑</span>Appearance</a>
+        <a href="#"><span class="i">◱</span>Sessions</a>
+        <a href="#"><span class="i">◆</span>Conductor</a>
+        <a href="#"><span class="i">⌘</span>Keybindings</a>
+        <a href="#"><span class="i">◮</span>Shared brain</a>
+      </nav>
+
+      <div class="ctrl">
+        <h2>Appearance</h2>
+        <div class="sub">How the cockpit looks. Themes are just design tokens — add your own anytime.</div>
+
+        <div class="seclabel">Theme <span class="cnt" id="curname">Tokyo Night</span></div>
+        <div class="tgrid" id="tgrid"></div>
+
+        <div class="seclabel">Options</div>
+        <div class="optrow"><div class="txt">Neon glow<small>Adds the SynthWave '84 outrun glow</small></div><div class="ctl"><button class="toggle on" id="glowToggle" aria-label="Toggle neon glow"></button></div></div>
+        <div class="optrow"><div class="txt">Keep agent colors consistent<small>Claude/Codex/opencode stay the same hue across themes</small></div><div class="ctl"><button class="toggle" id="agentsToggle" aria-label="Toggle consistent agent colors"></button></div></div>
+        <div class="optrow"><div class="txt">Density</div><div class="ctl"><div class="seg"><button data-opt="density" data-val="comfortable" class="on">Comfortable</button><button data-opt="density" data-val="compact">Compact</button></div></div></div>
+        <div class="optrow" style="border-bottom:none"><div class="txt">Terminal font size</div><div class="ctl"><div class="seg"><button data-opt="font" data-val="12">12</button><button data-opt="font" data-val="13" class="on">13</button><button data-opt="font" data-val="14">14</button></div></div></div>
+        <div class="note">Options besides theme + glow are shown for layout — they'll be wired in the real Settings panel.</div>
+      </div>
+
+      <div class="pv">
+        <div class="pvh"><span class="live"><i></i>Live preview</span><span class="now" id="nowlabel">Tokyo Night</span></div>
+        <div class="atelier glow" id="mock" data-scheme="tokyo-night">
+          <div class="abar">
+            <div class="dots"><i></i><i></i><i></i></div>
+            <div class="awrk">auth-service <em>· 4 agents</em></div>
+            <div class="akbd">Run anything <kbd>⌘</kbd><kbd>K</kbd></div>
+          </div>
+          <div class="astage">
+            <div class="cards">
+              <div class="card claude"><div class="ch"><span class="av">C</span><span class="nm">Claude <em>· backend</em></span><span class="br">mosaic/claude-be</span></div><div class="cb term"><span class="p">›</span> design the schema
+<span class="cor">⏺</span> <span class="code">users(id, email, created_at)</span>
+<span class="ok">⏺ recorded → brain</span></div></div>
+              <div class="card codex"><div class="ch"><span class="av">Cx</span><span class="nm">Codex <em>· frontend</em></span><span class="br">mosaic/codex-fe</span></div><div class="cb term"><span class="p">›</span> build signup form
+<span class="ok">⏺</span> fields: email, created_at
+<span class="cmt">// from shared brain</span> <span class="cur" style="color:var(--ok)"></span></div></div>
+              <div class="card oc"><div class="ch"><span class="av">oc</span><span class="nm">opencode <em>· tests</em></span><span class="br">mosaic/oc-tests</span></div><div class="cb term"><span class="p">›</span> vitest signup
+<span class="ok">✓ 12 passing</span></div></div>
+              <div class="card cond"><div class="ch"><span class="av">◆</span><span class="nm">Conductor <em>· opus</em></span><span class="br">autonomous</span></div><div class="cb term"><span class="am">◆</span> next: wire form → API
+<span class="dim">budget 3/8 · Stop anytime</span></div></div>
+            </div>
+            <div class="palette" role="dialog" aria-label="Command palette">
+              <div class="pq"><span class="mag">⌘</span><span>dispatch </span><span style="color:var(--dim)">to codex: wire the form to the API</span><span class="car"></span></div>
+              <div class="prow sel"><span class="ic">➤</span><div><div>Dispatch to <b>codex · frontend</b></div><small>send a task to the live session</small></div><span class="sc">↵</span></div>
+              <div class="prow"><span class="ic">◆</span><div><div>Make <b>this pane</b> the conductor</div><small>let it orchestrate the others</small></div><span class="sc">⌘.</span></div>
+              <div class="prow"><span class="ic">◮</span><div><div>Open <b>shared brain</b><small> — 4 decisions</small></div></div><span class="sc">⌘B</span></div>
+            </div>
+            <div class="dock">
+              <div class="cd"><span class="rec"></span><b>Conductor</b> <small>· 3 dispatched · 2 done</small></div>
+              <button class="stop">■ Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var THEMES=[
+    {id:'tokyo-night',name:'Tokyo Night',bg:'#1a1b26',dots:['#7aa2f7','#bb9af7','#7dcfff'],ln:'#7aa2f7',tag:'dark'},
+    {id:'synthwave',name:"SynthWave '84",bg:'#241b2f',dots:['#ff7edb','#36f9f6','#72f1b8'],ln:'#ff7edb',tag:'neon'},
+    {id:'ember',name:'Ember',bg:'#14110d',dots:['#f0a868','#e8785a','#7cc98a'],ln:'#f0a868',tag:'warm'},
+    {id:'slate',name:'Slate',bg:'#0e1116',dots:['#8aa2ff','#7fd0a0','#e8896a'],ln:'#8aa2ff',tag:'cool'},
+    {id:'rose',name:'Rosé Pine',bg:'#191724',dots:['#f6c177','#eb6f92','#9ccfd8'],ln:'#eb6f92',tag:'muted'},
+    {id:'nord',name:'Nord',bg:'#242933',dots:['#88c0d0','#a3be8c','#b48ead'],ln:'#88c0d0',tag:'cool'},
+    {id:'everforest',name:'Everforest',bg:'#272e33',dots:['#a7c080','#e69875','#7fbbb3'],ln:'#a7c080',tag:'green'},
+    {id:'paper',name:'Paper',bg:'#f4efe6',dots:['#c8842b','#c25a3f','#4e8a5a'],ln:'#c8842b',tag:'light'}
+  ];
+  var mock=document.getElementById('mock'),grid=document.getElementById('tgrid');
+  var curname=document.getElementById('curname'),nowlabel=document.getElementById('nowlabel');
+  var glowToggle=document.getElementById('glowToggle');
+  var agentsToggle=document.getElementById('agentsToggle');
+  var DEFAULTS={theme:'tokyo-night',glow:true,agents:false,density:'comfortable',font:'13'};
+  var FS={'12':'10.5px','13':'11.5px','14':'12.5px'};
+  var S;try{S=Object.assign({},DEFAULTS,JSON.parse(localStorage.getItem('mosaic.appearance'))||{});}catch(e){S=Object.assign({},DEFAULTS);}
+  function save(){try{localStorage.setItem('mosaic.appearance',JSON.stringify(S));}catch(e){}}
+
+  THEMES.forEach(function(t){
+    var b=document.createElement('button');
+    b.className='tcard';b.dataset.id=t.id;
+    b.innerHTML=
+      '<div class="tprev" style="background:'+t.bg+'">'+
+        '<div class="bar"><i></i><i></i><i></i></div>'+
+        '<div class="dts">'+t.dots.map(function(d){return '<i style="background:'+d+'"></i>';}).join('')+'</div>'+
+        '<div class="ln" style="background:'+t.ln+'"></div>'+
+      '</div>'+
+      '<div class="tmeta"><span class="nm">'+t.name+'</span><span class="tag">'+t.tag+'</span>'+
+        '<span class="ck" style="background:'+t.ln+'">✓</span></div>';
+    b.addEventListener('click',function(){apply(t.id);});
+    grid.appendChild(b);
+  });
+  var cards=[].slice.call(grid.querySelectorAll('.tcard'));
+  function byId(id){return THEMES.filter(function(x){return x.id===id;})[0];}
+  function setSeg(opt,val){[].forEach.call(document.querySelectorAll('[data-opt="'+opt+'"]'),function(b){b.classList.toggle('on',b.dataset.val===val);});}
+  function render(){
+    var t=byId(S.theme)||THEMES[0];
+    mock.setAttribute('data-scheme',S.theme);
+    mock.classList.toggle('glow',!!S.glow);
+    mock.classList.toggle('fixed-agents',!!S.agents);
+    mock.classList.toggle('compact',S.density==='compact');
+    mock.style.setProperty('--tfs',FS[S.font]||'11.5px');
+    curname.textContent=t.name;nowlabel.textContent=t.name;
+    glowToggle.classList.toggle('on',!!S.glow);
+    agentsToggle.classList.toggle('on',!!S.agents);
+    setSeg('density',S.density);setSeg('font',S.font);
+    glowToggle.closest('.optrow').style.opacity=(S.theme==='synthwave')?'1':'.5';
+    cards.forEach(function(c){var on=c.dataset.id===S.theme;c.classList.toggle('on',on);c.style.boxShadow=on?('0 0 0 2px '+t.ln):'';});
+  }
+  function apply(id){S.theme=id;save();render();}
+  glowToggle.addEventListener('click',function(){S.glow=!S.glow;save();render();});
+  agentsToggle.addEventListener('click',function(){S.agents=!S.agents;save();render();});
+  [].forEach.call(document.querySelectorAll('[data-opt]'),function(b){b.addEventListener('click',function(){S[b.dataset.opt]=b.dataset.val;save();render();});});
+  document.addEventListener('keydown',function(e){
+    if(e.target.closest('input,textarea'))return;
+    var i=parseInt(e.key,10);
+    if(i>=1&&i<=THEMES.length)apply(THEMES[i-1].id);
+  });
+  render();
+})();
+</script>
+</body>
+</html>
