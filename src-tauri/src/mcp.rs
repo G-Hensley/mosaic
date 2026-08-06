@@ -33,36 +33,45 @@ fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
 
 /// What a pane is told, in its own terminal, at the moment it becomes conductor.
 ///
-/// Written to counter a specific failure seen in practice: a promoted agent that
-/// has the dispatch tool, can see the other panes, and still does every task
-/// itself. Listing the tool is not enough — the agent has to be told that the
-/// other sessions are idle capacity it is expected to use, and that dispatches
-/// can be fired off together instead of one at a time. So this names the peers
-/// concretely, and says what they are good for.
+/// This is *typed into the composer and left there unsent* — see `set_conductor`
+/// for why. That shapes the text: it has to be short enough to read at a glance
+/// and to type after, because the user is expected to append their actual first
+/// instruction to it and send both together.
+///
+/// So this carries only what MCP cannot: the role is live *now*, and who is
+/// actually running. The playbook — how to write a task, recording decisions
+/// first, subagents versus sessions — is already in BRAIN_INSTRUCTIONS, which
+/// every agent receives on connect. Repeating it here just buried the two facts
+/// that were new.
 fn conductor_briefing(peers: &[String]) -> String {
-    // Same single-line constraint as dispatch_prompt: an embedded newline would
-    // submit this to the target CLI in fragments.
+    // Single line: a newline lands in most composers as a submit, which would
+    // fire this off half-written — exactly what we are avoiding.
     let roster = if peers.is_empty() {
-        "There are no other live sessions yet — the user can open more with Ctrl+K.".to_string()
+        "No other sessions are open yet (Ctrl+K opens one).".to_string()
     } else {
         format!(
             "Live sessions you can dispatch to: {}.",
+            // Just id and model. `roster_lines` also carries brain= and the
+            // conductor marker, which are useful in list_sessions output but are
+            // noise in a line the user has to read and type around; the agent can
+            // call list_sessions for the full picture.
             peers
                 .iter()
-                .map(|l| l.trim_start_matches("- ").replace('\n', " "))
+                .map(|l| {
+                    let l = l.trim_start_matches("- ").replace('\n', " ");
+                    match l.find(" brain=") {
+                        Some(i) => l[..i].to_string(),
+                        None => l,
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         )
     };
     format!(
-        "[mosaic] You are now the conductor of this Mosaic workspace. \
-You are not working alone: every other pane is a live AI coding agent, in its own terminal, on this same project, sitting idle until you give it something to do. \
+        "[mosaic] You are now the conductor of this workspace. \
 {roster} \
-Use the mosaic dispatch tool to hand any of them a task. You can dispatch to several sessions before polling any of them, so independent work runs in parallel across agents instead of one at a time; call get_task_result afterwards to collect the results. \
-Before you do a piece of work yourself, ask whether it splits across these agents instead. They are separate models with separate context windows, which makes them worth using for genuinely independent slices: different files or subsystems, separate research questions, or a second opinion on something you are unsure about. \
-Write a dispatched task the way you would brief a capable colleague who cannot see your screen — state the goal, the files or paths involved, and what to report back. \
-Anything they must agree on, record with record_decision before dispatching, so they build halves that fit together. \
-This does not replace your own subagents; prefer a Mosaic session when you want a different model or a genuinely separate context, and your own subagents for work inside your own."
+Each is a live agent idling until you give it work. Use the mosaic dispatch tool rather than doing separable work yourself; it returns immediately, so fan out every independent piece and collect with get_task_result. "
     )
 }
 
@@ -238,6 +247,14 @@ impl Shared {
     /// every other pane, and the observed result is that it just keeps working
     /// alone. The terminal is the only channel that reaches a *running* agent,
     /// so the role change is delivered the moment it becomes true.
+    ///
+    /// The briefing is typed into the composer but deliberately NOT submitted.
+    /// Auto-sending it made promotion silently spend a turn on a prompt the user
+    /// never wrote, and left them no way to say what they actually wanted done —
+    /// the pane just started talking. Leaving it unsent turns a hijacked turn
+    /// into a prefilled one: the user appends their real first instruction and
+    /// sends both together, so the agent learns its role and its task at once.
+    /// Dispatch still submits, because there no human is at the keyboard.
     pub fn set_conductor(&self, name: Option<String>) {
         *self.conductor.lock().unwrap() = name.clone();
         let _ = self.app.emit("conductor-changed", ());
@@ -257,13 +274,9 @@ impl Shared {
             .into_iter()
             .filter(|l| !l.starts_with(&format!("- {target} ")))
             .collect();
-        let engine = self.engine.clone();
-        // Off-thread: submit_to deliberately sleeps between the text and the
-        // Enter, and this runs inside a synchronous Tauri command that the UI
-        // awaits before repainting the conductor bar.
-        std::thread::spawn(move || {
-            engine.submit_to(&target, &conductor_briefing(&peers));
-        });
+        // write_to rather than submit_to: no Enter is sent, which also means no
+        // sleep, so this no longer needs a thread of its own.
+        let _ = self.engine.write_to(&target, &conductor_briefing(&peers));
     }
 
     pub fn conductor(&self) -> Option<String> {
@@ -708,7 +721,9 @@ mod tests {
 
     // Both terminal injections share the same hard constraint: an embedded
     // newline submits the message to the target CLI in fragments, so the agent
-    // acts on half a briefing.
+    // acts on half a briefing. It matters more for the briefing than for a
+    // dispatch, because the briefing is left unsent on purpose — a stray newline
+    // would fire it off before the user has added anything.
     #[test]
     fn conductor_briefing_is_single_line_and_names_the_peers() {
         let peers = vec![
@@ -728,7 +743,24 @@ mod tests {
         let msg = conductor_briefing(&[]);
 
         assert!(!msg.contains(['\r', '\n']));
-        assert!(msg.contains("no other live sessions"));
+        assert!(msg.contains("No other sessions are open yet"));
+    }
+
+    // The user has to be able to type their own instruction after it, so it has
+    // to stay short enough to read at a glance. The detail it used to carry now
+    // lives in BRAIN_INSTRUCTIONS, which every agent gets on connect.
+    #[test]
+    fn conductor_briefing_stays_short_enough_to_type_after() {
+        let peers = vec!["- sess-2 (codex) brain=main".to_string()];
+        let msg = conductor_briefing(&peers);
+
+        assert!(
+            msg.len() < 400,
+            "briefing is {} chars; it prefills the composer, so it must stay skimmable",
+            msg.len()
+        );
+        // Trailing space so the user's own text does not run into the last word.
+        assert!(msg.ends_with(' '));
     }
 
     #[test]

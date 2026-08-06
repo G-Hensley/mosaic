@@ -99,7 +99,12 @@ two channels, because they answer different questions:
 | Channel | Delivered | Says |
 |---|---|---|
 | MCP server instructions | Once, on connect | You are in Mosaic, here is the shared brain, here is what the conductor role means if you're given it |
-| Terminal injection | On promotion to conductor | You are the conductor *now*, here are the live sessions by name and model, dispatch them in parallel |
+| Composer prefill | On promotion to conductor | You are the conductor *now*, here are the live sessions by name and model |
+
+The prefill is typed into the pane's input but **not sent** — add your first
+instruction after it and press Enter, and the agent gets its role and its task
+together. Nothing is dispatched or spent until you do. It stays short for that
+reason; the detail lives in the connect-time instructions instead.
 
 All three agent CLIs surface the connect-time instructions to their model —
 verified by asking a live Claude Code, Codex and opencode session to quote the
