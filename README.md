@@ -90,6 +90,31 @@ Agents get these tools: `record_decision`, `record_fact`, `broadcast`,
 `get_shared_context`, `search_context`, `list_sessions`, `dispatch` (conductor
 only), `complete_task`, `get_task_result`, `set_session_identity`.
 
+## How agents are briefed
+
+Tools alone don't change behaviour — an agent that isn't told the other panes
+are usable capacity will quietly do everything itself. Mosaic briefs agents on
+two channels, because they answer different questions:
+
+| Channel | Delivered | Says |
+|---|---|---|
+| MCP server instructions | Once, on connect | You are in Mosaic, here is the shared brain, here is what the conductor role means if you're given it |
+| Terminal injection | On promotion to conductor | You are the conductor *now*, here are the live sessions by name and model, dispatch them in parallel |
+
+All three agent CLIs surface the connect-time instructions to their model —
+verified by asking a live Claude Code, Codex and opencode session to quote the
+first sentence back.
+
+The second exists because MCP hands a client its instructions once, at connect
+time, while the conductor is chosen by the user later and can change mid-run. An
+agent promoted at minute ten has never been told it now commands the workspace,
+so the role change is typed into its terminal the moment it happens — the only
+channel that reaches an already-running agent.
+
+Dispatch returns a `task_id` immediately rather than blocking, so a conductor is
+meant to fan several tasks out and then collect them; `get_task_result` with no
+`task_id` returns every task that conductor dispatched in one call.
+
 ## Guardrails
 
 - Only the conductor can dispatch, and the app assigns that role — an agent
@@ -112,14 +137,11 @@ only), `complete_task`, `get_task_result`, `set_session_identity`.
 
 ## Known gaps
 
-- **Agents are not yet told to use the brain.** The tools are exposed and
-  described, but nothing instructs an agent to read shared context before
-  deciding or record decisions after. Until that exists — a skill, or a line in
-  the project's `AGENTS.md` — the brain stays mostly empty in practice.
 - **Isolated work has no merge path.** A session's branch (`mosaic/<id>-<uid>`)
   survives when it has commits, but the UI never shows the branch name or a diff.
 - **Dispatch assumes an idle target.** Instructions are typed into the target's
   terminal; if that agent is mid-task the input is swallowed and the task sits
   pending until it times out.
 - Fit layout is intended for at most 6 panes; scroll layout remains usable beyond that.
-- No automated tests.
+- Thin test coverage: `cargo test` covers the two terminal injections and task
+  rendering. The PTY engine, worktrees, and the whole frontend are untested.

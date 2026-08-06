@@ -30,6 +30,25 @@ struct SessionHandle {
     worktree: Option<worktree::Worktree>,
 }
 
+/// How long to wait between writing a prompt and writing the Enter that submits
+/// it.
+///
+/// This is not a generic "let the UI settle" pause — it is sized against a
+/// specific, documented behaviour in the Codex TUI. Codex detects pasted input
+/// by burst timing, and for `PASTE_ENTER_SUPPRESS_WINDOW` (120 ms, anchored to
+/// the *last character received*, not to the flush) it deliberately treats a
+/// carriage return as "newline inside the paste" rather than "submit". An Enter
+/// sent inside that window is silently absorbed into the composer and the agent
+/// never sees the task at all — no error, no timeout signal, just a pane sitting
+/// idle with the instruction visible but unsent.
+///
+/// So this delay must clear 120 ms with room for ConPTY delivery lag, and the
+/// cost of overshooting is nothing (a dispatch is a rare, human-scale event)
+/// while the cost of undershooting is a dispatch that fails silently. Claude
+/// Code and opencode submit correctly at any delay, so one generous value serves
+/// all three rather than a per-CLI table that would drift as they change.
+const SUBMIT_ENTER_DELAY_MS: u64 = 300;
+
 #[derive(Default)]
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, SessionHandle>>,
@@ -71,9 +90,7 @@ impl SessionManager {
             return false;
         }
 
-        // Give the terminal UI time to consume the paste before Enter arrives,
-        // otherwise ConPTY may coalesce both writes into the same input read.
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(SUBMIT_ENTER_DELAY_MS));
         self.write_to(id, "\r")
     }
 
@@ -157,6 +174,18 @@ pub fn app_data_dir() -> PathBuf {
 /// Per-session scratch dir for the config files we hand an agent CLI at launch.
 fn session_config_dir(session_id: &str) -> PathBuf {
     app_data_dir().join("sessions").join(session_id)
+}
+
+/// Whether a session's program is an agent CLI that gets wired to the shared
+/// brain. Kept in step with the match in `agent_mcp_wiring`.
+///
+/// A Shell pane can be promoted to conductor like any other, but it has no MCP
+/// connection and so can never dispatch. Typing a briefing into it would just
+/// hand PowerShell a paragraph of prose to run.
+pub fn is_agent_cli(program: &str) -> bool {
+    let p = program.to_ascii_lowercase();
+    let p = p.trim_end_matches(".exe").trim_end_matches(".cmd");
+    matches!(p, "claude" | "codex" | "opencode")
 }
 
 /// Point ONE agent CLI at ONE dedicated MCP endpoint, entirely through launch
