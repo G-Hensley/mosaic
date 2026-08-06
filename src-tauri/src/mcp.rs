@@ -15,6 +15,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -538,8 +539,42 @@ impl BrainHandler {
     }
 }
 
+/// What every connecting agent is told about the workspace it just joined.
+///
+/// Exposing well-described tools is not enough on its own: an agent that is not
+/// told to consult shared context simply won't, and the brain stays empty while
+/// two agents build incompatible halves of the same thing. MCP carries these
+/// instructions on the connection itself, which is why this lives here rather
+/// than in each project's AGENTS.md — it reaches every session automatically,
+/// in whichever repo it was launched against.
+const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, and how they learn what you decide.
+
+Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
+
+How to work here:
+
+- BEFORE making a decision that affects shared work — architecture, dependencies, data models, API shapes, file layout, naming conventions — call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
+- Use search_context to check one specific topic before you spend effort researching it.
+- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here — it is what stops two agents building halves that don't fit together.
+- Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
+- Use broadcast for blockers, or anything the others need to know immediately.
+
+If a line appears in your terminal starting with "[mosaic] Task from conductor", that is real work assigned to you. Carry it out, then call complete_task with the task_id you were given and a short summary of the result. The conductor is blocked waiting on that call.
+
+Only the conductor can dispatch work. If you are not the conductor, the dispatch tool will refuse — that is expected, not an error to work around."#;
+
 #[tool_handler]
-impl ServerHandler for BrainHandler {}
+impl ServerHandler for BrainHandler {
+    // Supplying get_info suppresses the macro's generated one, so both the tools
+    // capability and our own name/version have to be restated here — otherwise
+    // no tools are advertised, and the server introduces itself to agents as
+    // "rmcp" (the default is resolved inside that crate, not ours).
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("mosaic", env!("CARGO_PKG_VERSION")))
+            .with_instructions(BRAIN_INSTRUCTIONS)
+    }
+}
 
 /// Bind the MCP server on a random loopback port and spawn it. Returns the port
 /// and the shared store (also used by the frontend `get_context` command).
