@@ -18,6 +18,7 @@ import { brainColorMap } from "./lib/brains";
 import "./App.css";
 
 type PaneStatus = "running" | "exited";
+type LayoutMode = "scroll" | "fit";
 type Pane = {
   id: string;
   type: SessionType;
@@ -31,6 +32,14 @@ function App() {
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [layout, setLayout] = useState<LayoutMode>(() => {
+    try {
+      return localStorage.getItem("mosaic.layout") === "fit" ? "fit" : "scroll";
+    } catch {
+      return "scroll";
+    }
+  });
+  const [focusedPane, setFocusedPane] = useState<string | null>(null);
   const [selectedBrain, setSelectedBrain] = useState("main");
   // The git repo sessions run in. Isolated sessions get worktrees of it.
   const [project, setProject] = useState<string | null>(() => {
@@ -112,6 +121,19 @@ function App() {
   function closePane(id: string) {
     killSession(id).catch(() => {});
     setPanes((p) => p.filter((x) => x.id !== id));
+    setFocusedPane((focused) => (focused === id ? null : focused));
+  }
+
+  function toggleLayout() {
+    setLayout((current) => {
+      const next = current === "scroll" ? "fit" : "scroll";
+      try {
+        localStorage.setItem("mosaic.layout", next);
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
   }
 
   function markExited(id: string) {
@@ -172,6 +194,8 @@ function App() {
       } else if (mod && e.key.toLowerCase() === "b") {
         e.preventDefault();
         setSidebarOpen((o) => !o);
+      } else if (e.key === "Escape") {
+        setFocusedPane(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -210,6 +234,17 @@ function App() {
         >
           Shared brain
         </button>
+        <button
+          className={"ghost" + (layout === "scroll" ? " on" : "")}
+          onClick={toggleLayout}
+          title={
+            layout === "scroll"
+              ? "Scrollable comfortable panes — click to fit all"
+              : "Fit every pane on screen — click for comfortable scrolling"
+          }
+        >
+          Layout: {layout === "scroll" ? "scroll" : "fit"}
+        </button>
         <button className="ghost" onClick={() => setSettingsOpen(true)} title="Appearance (⌘,)">
           Appearance
         </button>
@@ -223,7 +258,12 @@ function App() {
       )}
 
       <div className="body">
-        <main className="grid" data-count={count}>
+        <main
+          className="grid"
+          data-count={count}
+          data-layout={layout}
+          data-focused={focusedPane !== null}
+        >
           {panes.length === 0 ? (
             <div className="empty">
               <div className="empty-title">No sessions yet</div>
@@ -240,7 +280,11 @@ function App() {
               const color = colorMap[p.brain];
               return (
                 <section
-                  className={"pane" + (grouped ? " grouped" : "")}
+                  className={
+                    "pane" +
+                    (grouped ? " grouped" : "") +
+                    (focusedPane === p.id ? " focused" : "")
+                  }
                   key={p.id}
                   data-status={p.status}
                   style={grouped ? ({ "--brain": color } as CSSProperties) : undefined}
@@ -278,6 +322,14 @@ function App() {
                       onClick={() => toggleConductor(p.id)}
                     >
                       ⌁
+                    </button>
+                    <button
+                      className={"pane-focus" + (focusedPane === p.id ? " on" : "")}
+                      title={focusedPane === p.id ? "Show all panes (Esc)" : "Focus this pane"}
+                      aria-pressed={focusedPane === p.id}
+                      onClick={() => setFocusedPane((current) => (current === p.id ? null : p.id))}
+                    >
+                      {focusedPane === p.id ? "Restore" : "Focus"}
                     </button>
                     <button className="pane-x" title="Close session" onClick={() => closePane(p.id)}>
                       ✕

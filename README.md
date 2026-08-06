@@ -59,7 +59,11 @@ Rust, and pnpm.
 4. **⌁ on a pane** promotes it to conductor. Dispatched tasks are typed into the
    target's visible terminal, so you see every instruction. **Stop** halts all
    dispatch immediately.
-5. **Ctrl+B** toggles the sidebar; **Ctrl+,** opens appearance settings.
+5. **Layout: scroll** keeps every terminal at a comfortable minimum height and
+   scrolls the cockpit. Switch to **Layout: fit** when you want every pane visible
+   at once. **Focus** expands one pane without stopping or remounting the others;
+   press **Escape** to restore the grid.
+6. **Ctrl+B** toggles the sidebar; **Ctrl+,** opens appearance settings.
 
 ## How agents connect
 
@@ -112,5 +116,5 @@ only), `complete_task`, `get_task_result`, `set_session_identity`.
 - **Dispatch assumes an idle target.** Instructions are typed into the target's
   terminal; if that agent is mid-task the input is swallowed and the task sits
   pending until it times out.
-- The grid layout tops out at 6 panes.
+- Fit layout is intended for at most 6 panes; scroll layout remains usable beyond that.
 - No automated tests.

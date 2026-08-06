@@ -34,6 +34,9 @@ export function TerminalPane({
   const elRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const fitFrameRef = useRef<number | null>(null);
+  const scheduleFitRef = useRef<() => void>(() => {});
+  const lastSizeRef = useRef({ rows: 0, cols: 0 });
   const { theme, appearance } = useAppearance();
 
   // Create the terminal once for this pane.
@@ -52,6 +55,29 @@ export function TerminalPane({
     fit.fit();
     termRef.current = term;
     fitRef.current = fit;
+
+    const fitAndResize = () => {
+      fitFrameRef.current = null;
+      const el = elRef.current;
+      // Focus mode temporarily hides the other panes. Do not collapse their
+      // PTYs to zero columns; the observer runs again when they reappear.
+      if (!el || el.clientWidth < 40 || el.clientHeight < 40) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const last = lastSizeRef.current;
+      if (term.rows === last.rows && term.cols === last.cols) return;
+      lastSizeRef.current = { rows: term.rows, cols: term.cols };
+      resizeSession(sessionId, term.rows, term.cols).catch(() => {});
+    };
+    const scheduleFit = () => {
+      if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+      fitFrameRef.current = requestAnimationFrame(fitAndResize);
+    };
+    scheduleFitRef.current = scheduleFit;
+    lastSizeRef.current = { rows: term.rows, cols: term.cols };
 
     // Clipboard: xterm would otherwise swallow Ctrl+V and send a literal ^V.
     // Returning false declines the event so the browser's native paste reaches
@@ -78,14 +104,7 @@ export function TerminalPane({
     const channel = new Channel<Bytes>();
     channel.onmessage = (msg) => term.write(toBytes(msg));
 
-    const ro = new ResizeObserver(() => {
-      try {
-        fit.fit();
-      } catch {
-        /* element detached mid-teardown */
-      }
-      resizeSession(sessionId, term.rows, term.cols).catch(() => {});
-    });
+    const ro = new ResizeObserver(scheduleFit);
     ro.observe(elRef.current!);
 
     if (isolate) {
@@ -107,6 +126,8 @@ export function TerminalPane({
 
     return () => {
       ro.disconnect();
+      if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+      scheduleFitRef.current = () => {};
       unlisten.then((f) => f());
       term.dispose();
       termRef.current = null;
@@ -123,12 +144,7 @@ export function TerminalPane({
     if (!term || !fit) return;
     term.options.theme = theme.xterm;
     term.options.fontSize = appearance.fontSize;
-    try {
-      fit.fit();
-    } catch {
-      /* ignore */
-    }
-    resizeSession(sessionId, term.rows, term.cols).catch(() => {});
+    scheduleFitRef.current();
   }, [theme.id, theme.xterm, appearance.fontSize, sessionId]);
 
   return <div className="pane-term" ref={elRef} />;
