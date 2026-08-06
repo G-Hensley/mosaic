@@ -21,6 +21,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
+    // Keep the injection on one terminal line. Embedded CR/LF characters can
+    // become unintended submit events in a target CLI. Preserve all other
+    // whitespace because quoted commands and code fragments may depend on it.
+    let task = task.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    format!(
+        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} When finished, call the mosaic complete_task tool with task_id \"{task_id}\" and your result."
+    )
+}
+
 #[derive(Clone, Serialize)]
 pub struct Entry {
     pub kind: String, // "decision" | "fact" | "broadcast"
@@ -488,20 +498,12 @@ impl BrainHandler {
         let uid = uuid::Uuid::new_v4().simple().to_string();
         let id = uid[..6].to_string();
         // Typed into the target's terminal, so the human sees every instruction.
-        let injection = format!(
-            "[mosaic] Task from conductor '{me}' (task_id {id}): {}\r",
-            p.task
-        );
-        if !self.shared.engine.write_to(&p.target, &injection) {
+        // Submit Enter separately: Codex and Claude Code treat text+CR in one
+        // PTY write as a paste and can leave it waiting in the input editor.
+        let injection = dispatch_prompt(&me, &id, &p.task);
+        if !self.shared.engine.submit_to(&p.target, &injection) {
             return "Refused: could not write to that session.".to_string();
         }
-        // Nudge the target to report back, as a second line so it reads cleanly.
-        let _ = self.shared.engine.write_to(
-            &p.target,
-            &format!(
-                "[mosaic] When finished, call the mosaic complete_task tool with task_id \"{id}\" and your result.\r"
-            ),
-        );
 
         self.shared.add_task(Task {
             id: id.clone(),
@@ -536,6 +538,20 @@ impl BrainHandler {
             }
             Some(t) => format!("[{}] {} → {}", t.status, t.target, t.task),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch_prompt;
+
+    #[test]
+    fn dispatch_prompt_is_single_line_and_includes_completion_contract() {
+        let prompt = dispatch_prompt("sess-1", "abc123", "audit this\r\nthen report");
+
+        assert!(!prompt.contains(['\r', '\n']));
+        assert!(prompt.contains("audit this then report"));
+        assert!(prompt.contains("task_id \"abc123\""));
     }
 }
 

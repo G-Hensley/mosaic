@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -58,6 +60,21 @@ impl SessionManager {
             }
         }
         false
+    }
+
+    /// Submit a prompt to a terminal UI as typing followed by a distinct Enter
+    /// keypress. Codex and Claude Code deliberately distinguish pasted text
+    /// containing a carriage return from an interactive Enter event; writing
+    /// both in one PTY operation can leave the prompt sitting in the editor.
+    pub fn submit_to(&self, id: &str, prompt: &str) -> bool {
+        if !self.write_to(id, prompt) {
+            return false;
+        }
+
+        // Give the terminal UI time to consume the paste before Enter arrives,
+        // otherwise ConPTY may coalesce both writes into the same input read.
+        thread::sleep(Duration::from_millis(100));
+        self.write_to(id, "\r")
     }
 
     /// Ids of every live session.
