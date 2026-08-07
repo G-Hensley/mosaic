@@ -134,6 +134,51 @@ button.ghost.on {
   display: flex;
 }
 
+.spotlight-rail {
+  width: 132px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 0 8px 8px;
+  border-right: 1px solid var(--edge);
+  background: var(--bar);
+}
+
+.spotlight-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 10px;
+}
+
+.spotlight-item span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spotlight-item small {
+  color: var(--dim);
+  font-size: 9px;
+}
+
+.spotlight-item:hover,
+.spotlight-item.active {
+  color: var(--txt);
+  border-color: var(--acc);
+  background: var(--sel);
+}
+
 /* ---- Pane grid ---- */
 .grid {
   flex: 1;
@@ -145,18 +190,53 @@ button.ghost.on {
   grid-auto-rows: 1fr;
 }
 
-.grid[data-count="0"],
-.grid[data-count="1"] {
+/* Comfortable mode keeps terminals usable and lets the cockpit itself scroll.
+   Fit mode remains available for monitoring every pane at once. */
+.grid[data-layout="scroll"][data-columns="auto"] {
+  overflow-y: auto;
+  scrollbar-color: var(--edge) var(--bg);
+  grid-template-columns: repeat(auto-fit, minmax(min(460px, 100%), 1fr));
+  grid-auto-rows: minmax(var(--pane-min-height), 1fr);
+}
+
+.grid[data-layout="scroll"]:not([data-columns="auto"]) {
+  overflow-y: auto;
+  scrollbar-color: var(--edge) var(--bg);
+  grid-template-columns: repeat(var(--layout-columns), minmax(0, 1fr));
+  grid-auto-rows: minmax(var(--pane-min-height), 1fr);
+}
+
+.grid[data-layout="fit"] {
+  overflow-y: auto;
+  grid-auto-rows: minmax(180px, 1fr);
+}
+
+.grid[data-layout="fit"][data-count="0"],
+.grid[data-layout="fit"][data-count="1"] {
   grid-template-columns: 1fr;
 }
-.grid[data-count="2"],
-.grid[data-count="3"],
-.grid[data-count="4"] {
+.grid[data-layout="fit"][data-count="2"],
+.grid[data-layout="fit"][data-count="3"],
+.grid[data-layout="fit"][data-count="4"] {
   grid-template-columns: 1fr 1fr;
 }
-.grid[data-count="5"],
-.grid[data-count="6"] {
+.grid[data-layout="fit"][data-count="5"],
+.grid[data-layout="fit"][data-count="6"] {
   grid-template-columns: 1fr 1fr 1fr;
+}
+
+.grid[data-layout="fit"]:not([data-columns="auto"]) {
+  grid-template-columns: repeat(var(--layout-columns), minmax(0, 1fr));
+}
+
+.grid[data-layout][data-focused="true"] {
+  overflow: hidden;
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+
+.grid[data-layout][data-focused="true"] .pane:not(.focused) {
+  display: none;
 }
 
 /* ---- A single pane ---- */
@@ -173,6 +253,11 @@ button.ghost.on {
 
 .pane[data-status="exited"] {
   opacity: 0.72;
+}
+
+.pane:focus-within {
+  border-color: var(--acc);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--acc) 35%, transparent);
 }
 
 .pane-head {
@@ -230,6 +315,23 @@ button.ghost.on {
   font-size: 12px;
 }
 
+.pane-focus {
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.pane-focus:hover,
+.pane-focus.on {
+  color: var(--acc);
+  border-color: var(--acc);
+  background: var(--sel);
+}
+
 .pane-x:hover {
   color: var(--danger);
   background: var(--sel);
@@ -259,14 +361,56 @@ button.ghost.on {
 .pane-term {
   flex: 1;
   min-height: 0;
-  padding: 6px 4px 4px 8px;
+  padding: 0;
+  overflow: hidden;
   background: var(--panel);
 }
 
-.pane-term .xterm,
-.pane-term .xterm-viewport,
-.pane-term .xterm-screen {
+.pane-term .xterm {
   height: 100%;
+  padding: 6px 4px 4px 8px;
+}
+
+.layout-settings {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.layout-help {
+  margin: 8px 0 0;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.layout-columns .seg-btn {
+  min-width: 48px;
+}
+
+.layout-slider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.layout-value {
+  color: var(--acc);
+  font-variant-numeric: tabular-nums;
+}
+
+.layout-slider {
+  width: 100%;
+  accent-color: var(--acc);
+}
+
+.layout-slider:disabled {
+  opacity: 0.35;
+}
+
+.layout-scale {
+  display: flex;
+  justify-content: space-between;
+  color: var(--dim);
+  font-size: 10px;
 }
 
 /* ---- Empty state ---- */

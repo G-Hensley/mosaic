@@ -9,10 +9,14 @@
 mod mcp;
 mod worktree;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -26,6 +30,111 @@ struct SessionHandle {
     child: Box<dyn Child + Send + Sync>,
     /// Present when this session runs isolated in its own git worktree.
     worktree: Option<worktree::Worktree>,
+    /// When this session last produced output, on the `mono_ms` clock. Written by
+    /// the reader thread, read by `submit_to` to tell when a target has finished
+    /// absorbing a pasted prompt. See `SUBMIT_QUIET_MS`.
+    last_output: Arc<AtomicU64>,
+    /// The program this session launched, so `submit_to` can tell which CLI it is
+    /// typing into. Only Codex gets bracketed-paste framing; see `PASTE_START`.
+    program: String,
+}
+
+/// Process-monotonic millisecond clock, used to time the gap between a prompt
+/// and the Enter that submits it.
+///
+/// Deliberately not `SystemTime`: that can step backwards (NTP correction, a DST
+/// change), which would make a target's last-output timestamp look arbitrarily
+/// far in the past. Quiet would then read as satisfied instantly and Enter would
+/// fire early — precisely the failure this module exists to prevent.
+static CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn mono_ms() -> u64 {
+    CLOCK.elapsed().as_millis() as u64
+}
+
+/// How long a target's output must be quiet before we accept that it has
+/// finished receiving the prompt.
+///
+/// Sized against documented behaviour in the Codex TUI. Codex infers a paste
+/// from keystroke burst timing, and suppresses Enter for 120 ms afterwards —
+/// but it re-anchors that window on *every* buffered character, so the deadline
+/// keeps moving for as long as bytes are still arriving. An Enter that lands
+/// inside the window is absorbed into the composer as a newline, and the agent
+/// never sees the task: no error, no timeout signal, just a pane sitting idle
+/// with the instruction visible but unsent.
+///
+/// The previous fixed sleep measured from our own `write_all` returning, which
+/// is the wrong anchor — that only means the bytes reached the PTY buffer, not
+/// that the target consumed them. For a large payload ConPTY is still delivering
+/// well after the call returns, so a 1946-character dispatch reliably lost its
+/// Enter. Waiting for the target's *output* to stop instead measures the thing
+/// that actually matters, and adapts to payload size and machine load for free.
+/// 200 ms clears Codex's 120 ms window with room for delivery lag.
+const SUBMIT_QUIET_MS: u64 = 200;
+
+/// Never send Enter sooner than this after the write, however quiet the target
+/// looks. A CLI that renders nothing in response to input is "quiet" the instant
+/// we finish writing, which tells us nothing at all — this floor is what covers
+/// that case. It is also the delay the previous implementation used, so short
+/// prompts wait exactly as long as they did before and cannot regress.
+const SUBMIT_FLOOR_MS: u64 = 300;
+
+/// Give up waiting for quiet and send Enter regardless. An agent that is already
+/// mid-task streams output continuously and would never look quiet, so without a
+/// ceiling its dispatch would wait forever. This bounds the wait instead.
+const SUBMIT_CEILING_MS: u64 = 4000;
+
+/// How often to re-check for quiet while waiting.
+const SUBMIT_POLL_MS: u64 = 20;
+
+/// Bracketed paste markers (DECSET 2004). Wrapping a payload in these makes it
+/// one explicit paste event with a defined end, instead of something the target
+/// has to infer from keystroke burst timing — which removes the guesswork the
+/// timing policy above can only approximate.
+///
+/// Applied to Codex alone, deliberately. Codex is the CLI whose burst inference
+/// loses the Enter, and it recommends this framing for itself. Claude Code
+/// already submits reliably, so there is nothing to gain there and a real regression
+/// to risk if it turned out not to honour the markers: an unsupported sequence
+/// does not vanish, it lands in the composer as literal junk. opencode is
+/// verified to support them and can be added once it has been exercised.
+const PASTE_START: &str = "\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
+
+fn is_codex(program: &str) -> bool {
+    let p = program.to_ascii_lowercase();
+    p.trim_end_matches(".exe").trim_end_matches(".cmd") == "codex"
+}
+
+/// Whether the Enter that submits a prompt can be sent yet.
+///
+/// Split out from the waiting loop so the policy is testable without a live PTY.
+///
+/// `baseline` is the target's output clock sampled *before* the prompt was
+/// written, and comparing against it is what makes this correct. The previous
+/// version asked only "has output been quiet for a while", which a target that
+/// stays silent while it buffers a paste satisfies trivially — its last output
+/// predates the write, so the gap is already enormous and Enter fires the moment
+/// the floor elapses. That is exactly the original bug wearing a new hat, and it
+/// is what a large dispatch to Codex hit: it echoes nothing until its burst
+/// flushes, so "quiet" meant "has not started yet" rather than "has finished".
+///
+/// Silence before the target has produced anything therefore counts as still
+/// receiving. Only once it has actually said something does going quiet mean it
+/// is done, and the ceiling still bounds the wait if it never speaks at all.
+fn ready_to_submit(now: u64, started: u64, last_output: u64, baseline: u64) -> bool {
+    let waited = now.saturating_sub(started);
+    // Checked first so a silent target is always released eventually.
+    if waited >= SUBMIT_CEILING_MS {
+        return true;
+    }
+    if waited < SUBMIT_FLOOR_MS {
+        return false;
+    }
+    if last_output == baseline {
+        return false;
+    }
+    now.saturating_sub(last_output) >= SUBMIT_QUIET_MS
 }
 
 #[derive(Default)]
@@ -58,6 +167,59 @@ impl SessionManager {
             }
         }
         false
+    }
+
+    /// The session's output-activity clock and launched program, if it is live.
+    fn session_meta(&self, id: &str) -> Option<(Arc<AtomicU64>, String)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|h| (h.last_output.clone(), h.program.clone()))
+    }
+
+    /// Submit a prompt to a terminal UI as typing followed by a distinct Enter
+    /// keypress. Codex and Claude Code deliberately distinguish pasted text
+    /// containing a carriage return from an interactive Enter event; writing
+    /// both in one PTY operation can leave the prompt sitting in the editor.
+    ///
+    /// The prompt is written synchronously, so an unreachable session is still
+    /// reported to the caller. The Enter is not: it waits for the target to stop
+    /// producing output (see `SUBMIT_QUIET_MS`) on a thread of its own, because
+    /// that wait is open-ended and dispatch is specifically documented to return
+    /// immediately so a conductor can fan work out. Blocking here would serialize
+    /// a fan-out into one round trip per target, which is the property dispatch
+    /// exists to provide.
+    ///
+    /// A `true` return therefore means "delivered to the terminal", not "already
+    /// submitted".
+    pub fn submit_to(self: &Arc<Self>, id: &str, prompt: &str) -> bool {
+        // Resolved before the write so the output clock can be sampled first:
+        // the baseline is only meaningful if it predates the prompt.
+        let Some((clock, program)) = self.session_meta(id) else {
+            return false;
+        };
+        let baseline = clock.load(Ordering::Relaxed);
+
+        let payload: Cow<'_, str> = if is_codex(&program) {
+            Cow::Owned(format!("{PASTE_START}{prompt}{PASTE_END}"))
+        } else {
+            Cow::Borrowed(prompt)
+        };
+        if !self.write_to(id, &payload) {
+            return false;
+        }
+
+        let engine = self.clone();
+        let id = id.to_string();
+        thread::spawn(move || {
+            let started = mono_ms();
+            while !ready_to_submit(mono_ms(), started, clock.load(Ordering::Relaxed), baseline) {
+                thread::sleep(Duration::from_millis(SUBMIT_POLL_MS));
+            }
+            engine.write_to(&id, "\r");
+        });
+        true
     }
 
     /// Ids of every live session.
@@ -140,6 +302,18 @@ pub fn app_data_dir() -> PathBuf {
 /// Per-session scratch dir for the config files we hand an agent CLI at launch.
 fn session_config_dir(session_id: &str) -> PathBuf {
     app_data_dir().join("sessions").join(session_id)
+}
+
+/// Whether a session's program is an agent CLI that gets wired to the shared
+/// brain. Kept in step with the match in `agent_mcp_wiring`.
+///
+/// A Shell pane can be promoted to conductor like any other, but it has no MCP
+/// connection and so can never dispatch. Typing a briefing into it would just
+/// hand PowerShell a paragraph of prose to run.
+pub fn is_agent_cli(program: &str) -> bool {
+    let p = program.to_ascii_lowercase();
+    let p = p.trim_end_matches(".exe").trim_end_matches(".cmd");
+    matches!(p, "claude" | "codex" | "opencode")
 }
 
 /// Point ONE agent CLI at ONE dedicated MCP endpoint, entirely through launch
@@ -286,6 +460,10 @@ async fn spawn_session(
     let mut args = args;
     args.extend(extra_args);
 
+    // Starts "active now" so a session that never writes anything is governed by
+    // SUBMIT_FLOOR_MS rather than looking quiet since the epoch.
+    let activity = Arc::new(AtomicU64::new(mono_ms()));
+
     // Create the PTY + child under the spawn lock (serialize ConPTY spawns). The
     // lock guard is confined to this block so it never crosses the .await below.
     let mut reader = {
@@ -317,20 +495,29 @@ async fn spawn_session(
                 writer,
                 child,
                 worktree: wt,
+                last_output: activity.clone(),
+                program: program.clone(),
             },
         );
         reader
     };
 
     // Blocking reads on their own thread → async forward loop via mpsc.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // Bound each session's pending output to roughly 512 KiB. Backpressure here
+    // is preferable to six unbounded queues consuming memory when WebView2 is
+    // busy or minimized; ConPTY naturally blocks the child until we catch up.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+                    // Stamped on arrival rather than after the send, which can
+                    // block on a full channel and would misreport the target as
+                    // quiet while it is in fact still talking.
+                    activity.store(mono_ms(), Ordering::Relaxed);
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -338,7 +525,16 @@ async fn spawn_session(
         }
     });
 
-    while let Some(bytes) = rx.recv().await {
+    while let Some(mut bytes) = rx.recv().await {
+        // Drain queued bursts into fewer IPC messages without adding latency to
+        // interactive output. Keep batches modest so one noisy agent cannot
+        // monopolize the WebView event loop.
+        while bytes.len() < 64 * 1024 {
+            match rx.try_recv() {
+                Ok(next) => bytes.extend_from_slice(&next),
+                Err(_) => break,
+            }
+        }
         if channel.send(&bytes[..]).is_err() {
             break;
         }
@@ -481,6 +677,82 @@ fn set_conductor(shared: State<'_, Arc<mcp::Shared>>, name: Option<String>) {
 #[tauri::command]
 fn halt_conductor(shared: State<'_, Arc<mcp::Shared>>, halted: bool) {
     shared.set_halted(halted);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_codex, ready_to_submit, SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS};
+
+    // A dispatch is only lost in one direction: an Enter sent too early is
+    // swallowed silently, while one sent late costs nothing but a pause. Every
+    // case below is therefore written from the "hold unless certain" side.
+    //
+    // `baseline` is the output clock as of the write. Cases where it still equals
+    // `last_output` are the target not having reacted yet.
+
+    // Stands in for the output clock as of the write. Kept below the `now` values
+    // used here so the cases stay arithmetically honest.
+    const BASE: u64 = 100;
+
+    #[test]
+    fn holds_below_the_floor() {
+        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, BASE + 1, BASE));
+    }
+
+    // The regression that shipped: a target which stays silent while it buffers a
+    // paste has a last-output timestamp predating the write, so "quiet for long
+    // enough" was true the instant the floor elapsed and Enter fired straight into
+    // the paste. Silence before the target has said anything must not count.
+    #[test]
+    fn holds_while_a_silent_target_has_not_reacted_to_the_write_yet() {
+        // Inside the ceiling window, so this isolates the has-it-reacted rule
+        // rather than the backstop that eventually overrides it.
+        let now = SUBMIT_FLOOR_MS + 500;
+        assert!(now < SUBMIT_CEILING_MS);
+        // Stale by design: the target has produced nothing since before the write,
+        // so an elapsed-quiet check alone would read this as "finished" and fire.
+        assert!(now - BASE >= SUBMIT_QUIET_MS);
+        assert!(!ready_to_submit(now, 0, BASE, BASE));
+    }
+
+    #[test]
+    fn submits_once_the_target_has_spoken_and_then_gone_quiet() {
+        let now = SUBMIT_FLOOR_MS + SUBMIT_QUIET_MS;
+        let last_output = now - SUBMIT_QUIET_MS;
+        assert!(last_output != BASE);
+        assert!(ready_to_submit(now, 0, last_output, BASE));
+    }
+
+    #[test]
+    fn holds_while_the_target_is_still_producing_output() {
+        let now = SUBMIT_FLOOR_MS + 500;
+        assert!(!ready_to_submit(now, 0, now - 10, BASE));
+    }
+
+    #[test]
+    fn submits_at_the_ceiling_even_if_the_target_never_speaks() {
+        // Backstop for a CLI that echoes nothing at all: without this the
+        // has-it-reacted rule would hold the Enter forever.
+        assert!(ready_to_submit(SUBMIT_CEILING_MS, 0, BASE, BASE));
+    }
+
+    #[test]
+    fn quiet_is_measured_from_the_last_output_not_from_the_write() {
+        let now = SUBMIT_FLOOR_MS + 1_000;
+        assert!(ready_to_submit(now, 0, now - SUBMIT_QUIET_MS, BASE));
+        assert!(!ready_to_submit(now, 0, now - (SUBMIT_QUIET_MS - 1), BASE));
+    }
+
+    #[test]
+    fn only_codex_is_framed_as_a_bracketed_paste() {
+        assert!(is_codex("codex"));
+        assert!(is_codex("Codex.cmd"));
+        assert!(is_codex("CODEX.EXE"));
+        // Claude Code already submits reliably and must keep its plain path.
+        assert!(!is_codex("claude"));
+        assert!(!is_codex("opencode"));
+        assert!(!is_codex("powershell.exe"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

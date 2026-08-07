@@ -34,6 +34,9 @@ export function TerminalPane({
   const elRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const fitFrameRef = useRef<number | null>(null);
+  const scheduleFitRef = useRef<() => void>(() => {});
+  const lastSizeRef = useRef({ rows: 0, cols: 0 });
   const { theme, appearance } = useAppearance();
 
   // Create the terminal once for this pane.
@@ -52,6 +55,44 @@ export function TerminalPane({
     fit.fit();
     termRef.current = term;
     fitRef.current = fit;
+
+    let resizeInFlight = false;
+    let desiredSize: { rows: number; cols: number } | null = null;
+    let alive = true;
+    const pumpResize = async () => {
+      if (resizeInFlight) return;
+      resizeInFlight = true;
+      while (alive && desiredSize) {
+        const next = desiredSize;
+        desiredSize = null;
+        await resizeSession(sessionId, next.rows, next.cols).catch(() => {});
+      }
+      resizeInFlight = false;
+    };
+
+    const fitAndResize = () => {
+      fitFrameRef.current = null;
+      const el = elRef.current;
+      // Focus mode temporarily hides the other panes. Do not collapse their
+      // PTYs to zero columns; the observer runs again when they reappear.
+      if (!el || el.clientWidth < 40 || el.clientHeight < 40) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      const last = lastSizeRef.current;
+      if (term.rows === last.rows && term.cols === last.cols) return;
+      lastSizeRef.current = { rows: term.rows, cols: term.cols };
+      desiredSize = { rows: term.rows, cols: term.cols };
+      void pumpResize();
+    };
+    const scheduleFit = () => {
+      if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+      fitFrameRef.current = requestAnimationFrame(fitAndResize);
+    };
+    scheduleFitRef.current = scheduleFit;
+    lastSizeRef.current = { rows: term.rows, cols: term.cols };
 
     // Clipboard: xterm would otherwise swallow Ctrl+V and send a literal ^V.
     // Returning false declines the event so the browser's native paste reaches
@@ -76,16 +117,44 @@ export function TerminalPane({
     });
 
     const channel = new Channel<Bytes>();
-    channel.onmessage = (msg) => term.write(toBytes(msg));
-
-    const ro = new ResizeObserver(() => {
-      try {
-        fit.fit();
-      } catch {
-        /* element detached mid-teardown */
+    const outputQueue: Uint8Array[] = [];
+    let outputBytes = 0;
+    let outputFrame: number | null = null;
+    const flushOutput = () => {
+      outputFrame = null;
+      if (outputQueue.length === 0) return;
+      outputBytes = 0;
+      if (outputQueue.length === 1) {
+        term.write(outputQueue.shift()!);
+        return;
       }
-      resizeSession(sessionId, term.rows, term.cols).catch(() => {});
-    });
+      const total = outputQueue.reduce((n, chunk) => n + chunk.byteLength, 0);
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of outputQueue.splice(0)) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      term.write(merged);
+    };
+    channel.onmessage = (msg) => {
+      const bytes = toBytes(msg);
+      outputQueue.push(bytes);
+      outputBytes += bytes.byteLength;
+      if (outputBytes >= 64 * 1024) {
+        if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+        flushOutput();
+      } else if (outputFrame === null) {
+        outputFrame = requestAnimationFrame(flushOutput);
+      }
+    };
+    const writeAfterQueuedOutput = (data: string) => {
+      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      flushOutput();
+      term.write(data);
+    };
+
+    const ro = new ResizeObserver(scheduleFit);
     ro.observe(elRef.current!);
 
     if (isolate) {
@@ -94,11 +163,11 @@ export function TerminalPane({
     spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
       isolate,
       cwd,
-    }).catch((e) => term.write(`\r\n\x1b[31m[spawn error] ${e}\x1b[0m\r\n`));
+    }).catch((e) => writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${e}\x1b[0m\r\n`));
 
     const unlisten = listen<string>("session-exited", (ev) => {
       if (ev.payload === sessionId) {
-        term.write("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
+        writeAfterQueuedOutput("\r\n\x1b[38;5;245m[session ended]\x1b[0m\r\n");
         onExit(sessionId);
       }
     });
@@ -106,7 +175,12 @@ export function TerminalPane({
     term.focus();
 
     return () => {
+      alive = false;
+      desiredSize = null;
       ro.disconnect();
+      if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+      if (outputFrame !== null) cancelAnimationFrame(outputFrame);
+      scheduleFitRef.current = () => {};
       unlisten.then((f) => f());
       term.dispose();
       termRef.current = null;
@@ -123,12 +197,7 @@ export function TerminalPane({
     if (!term || !fit) return;
     term.options.theme = theme.xterm;
     term.options.fontSize = appearance.fontSize;
-    try {
-      fit.fit();
-    } catch {
-      /* ignore */
-    }
-    resizeSession(sessionId, term.rows, term.cols).catch(() => {});
+    scheduleFitRef.current();
   }, [theme.id, theme.xterm, appearance.fontSize, sessionId]);
 
   return <div className="pane-term" ref={elRef} />;

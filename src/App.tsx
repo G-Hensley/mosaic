@@ -7,6 +7,11 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { ContextSidebar } from "./components/ContextSidebar";
 import { ConductorBar } from "./components/ConductorBar";
 import {
+  LayoutPanel,
+  type LayoutColumns,
+  type LayoutMode,
+} from "./components/LayoutPanel";
+import {
   killSession,
   setAgentBrain,
   conductorState,
@@ -30,7 +35,34 @@ function App() {
   const [panes, setPanes] = useState<Pane[]>([]);
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [layoutOpen, setLayoutOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [layout, setLayout] = useState<LayoutMode>(() => {
+    try {
+      return localStorage.getItem("mosaic.layout") === "fit" ? "fit" : "scroll";
+    } catch {
+      return "scroll";
+    }
+  });
+  const [focusedPane, setFocusedPane] = useState<string | null>(null);
+  const [layoutColumns, setLayoutColumns] = useState<LayoutColumns>(() => {
+    try {
+      const value = localStorage.getItem("mosaic.layout.columns");
+      return /^[1-6]$/.test(value ?? "")
+        ? (Number(value) as LayoutColumns)
+        : "auto";
+    } catch {
+      return "auto";
+    }
+  });
+  const [paneHeight, setPaneHeight] = useState(() => {
+    try {
+      const value = Number(localStorage.getItem("mosaic.layout.paneHeight"));
+      return value >= 280 && value <= 720 ? value : 420;
+    } catch {
+      return 420;
+    }
+  });
   const [selectedBrain, setSelectedBrain] = useState("main");
   // The git repo sessions run in. Isolated sessions get worktrees of it.
   const [project, setProject] = useState<string | null>(() => {
@@ -112,7 +144,18 @@ function App() {
   function closePane(id: string) {
     killSession(id).catch(() => {});
     setPanes((p) => p.filter((x) => x.id !== id));
+    setFocusedPane((focused) => (focused === id ? null : focused));
   }
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("mosaic.layout", layout);
+      localStorage.setItem("mosaic.layout.columns", String(layoutColumns));
+      localStorage.setItem("mosaic.layout.paneHeight", String(paneHeight));
+    } catch {
+      /* ignore */
+    }
+  }, [layout, layoutColumns, paneHeight]);
 
   function markExited(id: string) {
     setPanes((p) => p.map((x) => (x.id === id ? { ...x, status: "exited" } : x)));
@@ -159,23 +202,54 @@ function App() {
     handleDropOnBrain(brain, e.dataTransfer.getData("text/plain"));
   }
 
-  // ⌘K launcher · ⌘, appearance · ⌘B sidebar.
+  // Capture app shortcuts before xterm sees them. Plain Ctrl+K/Ctrl+B belong
+  // to terminal applications, so Mosaic uses Ctrl+Shift chords instead.
   useEffect(() => {
+    const focusPaneAt = (index: number) => {
+      const pane = document.querySelectorAll<HTMLElement>(".pane")[index];
+      if (!pane) return;
+      const id = pane.dataset.paneId;
+      // While a pane is maximized, move the spotlight to the requested one rather
+      // than dropping out of focus mode. The rail button beside this shortcut
+      // switches panes, and its tooltip advertises the shortcut as the same
+      // action, so exiting instead made the two disagree. Outside focus mode
+      // there is no spotlight to move and the rAF below just focuses the terminal.
+      if (id) setFocusedPane((current) => (current ? id : current));
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() =>
+          pane.querySelector<HTMLElement>(".xterm-helper-textarea")?.focus(),
+        ),
+      );
+    };
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key.toLowerCase() === "k") {
+      if (mod && e.shiftKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
+        e.stopPropagation();
         setLauncherOpen((o) => !o);
-      } else if (mod && e.key === ",") {
+      } else if (mod && e.shiftKey && e.key === ",") {
         e.preventDefault();
+        e.stopPropagation();
         setSettingsOpen((o) => !o);
-      } else if (mod && e.key.toLowerCase() === "b") {
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === "b") {
         e.preventDefault();
+        e.stopPropagation();
         setSidebarOpen((o) => !o);
+      } else if (mod && e.shiftKey && /^[1-9]$/.test(e.key)) {
+        e.preventDefault();
+        e.stopPropagation();
+        focusPaneAt(Number(e.key) - 1);
+      } else if (mod && e.shiftKey && e.key === "Enter") {
+        const pane = document.activeElement?.closest<HTMLElement>(".pane");
+        const id = pane?.dataset.paneId;
+        if (!id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setFocusedPane((current) => (current === id ? null : id));
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, []);
 
   // Same-brain panes cluster together; order is stable so drags don't remount.
@@ -206,15 +280,26 @@ function App() {
         <button
           className={"ghost" + (sidebarOpen ? " on" : "")}
           onClick={() => setSidebarOpen((o) => !o)}
-          title="Shared brain (⌘B)"
+          title="Shared brain (Ctrl+Shift+B)"
         >
           Shared brain
         </button>
-        <button className="ghost" onClick={() => setSettingsOpen(true)} title="Appearance (⌘,)">
+        <button
+          className={"ghost" + (layout === "scroll" ? " on" : "")}
+          onClick={() => setLayoutOpen(true)}
+          title="Customize terminal layout"
+        >
+          Layout: {layoutColumns === "auto" ? "auto" : `${layoutColumns} col`}
+        </button>
+        <button
+          className="ghost"
+          onClick={() => setSettingsOpen(true)}
+          title="Appearance (Ctrl+Shift+,)"
+        >
           Appearance
         </button>
         <button className="primary" onClick={() => setLauncherOpen(true)}>
-          + New session <kbd>⌘K</kbd>
+          + New session <kbd>Ctrl Shift K</kbd>
         </button>
       </header>
 
@@ -223,7 +308,35 @@ function App() {
       )}
 
       <div className="body">
-        <main className="grid" data-count={count}>
+        {focusedPane && (
+          <nav className="spotlight-rail" aria-label="Live sessions">
+            {ordered.map((p, index) => (
+              <button
+                key={p.id}
+                className={"spotlight-item" + (focusedPane === p.id ? " active" : "")}
+                onClick={() => setFocusedPane(p.id)}
+                title={`Switch to ${p.type.label} ${p.id} (Ctrl+Shift+${index + 1})`}
+              >
+                <span className="dot" style={{ background: p.type.color }} />
+                <span>{p.type.label}</span>
+                <small>{index + 1}</small>
+              </button>
+            ))}
+          </nav>
+        )}
+        <main
+          className="grid"
+          data-count={count}
+          data-layout={layout}
+          data-columns={layoutColumns}
+          data-focused={focusedPane !== null}
+          style={
+            {
+              "--layout-columns": layoutColumns === "auto" ? 1 : layoutColumns,
+              "--pane-min-height": `${paneHeight}px`,
+            } as CSSProperties
+          }
+        >
           {panes.length === 0 ? (
             <div className="empty">
               <div className="empty-title">No sessions yet</div>
@@ -232,7 +345,7 @@ function App() {
                 other or a brain in the sidebar — to share context.
               </div>
               <button className="primary" onClick={() => setLauncherOpen(true)}>
-                + New session <kbd>⌘K</kbd>
+                + New session <kbd>Ctrl Shift K</kbd>
               </button>
             </div>
           ) : (
@@ -240,8 +353,13 @@ function App() {
               const color = colorMap[p.brain];
               return (
                 <section
-                  className={"pane" + (grouped ? " grouped" : "")}
+                  className={
+                    "pane" +
+                    (grouped ? " grouped" : "") +
+                    (focusedPane === p.id ? " focused" : "")
+                  }
                   key={p.id}
+                  data-pane-id={p.id}
                   data-status={p.status}
                   style={grouped ? ({ "--brain": color } as CSSProperties) : undefined}
                   onDragOver={allowDrop}
@@ -279,6 +397,14 @@ function App() {
                     >
                       ⌁
                     </button>
+                    <button
+                      className={"pane-focus" + (focusedPane === p.id ? " on" : "")}
+                      title={focusedPane === p.id ? "Show all panes" : "Maximize this pane"}
+                      aria-pressed={focusedPane === p.id}
+                      onClick={() => setFocusedPane((current) => (current === p.id ? null : p.id))}
+                    >
+                      {focusedPane === p.id ? "Restore" : "Maximize"}
+                    </button>
                     <button className="pane-x" title="Close session" onClick={() => closePane(p.id)}>
                       ✕
                     </button>
@@ -314,6 +440,17 @@ function App() {
         <SessionLauncher onPick={addSession} onClose={() => setLauncherOpen(false)} />
       )}
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {layoutOpen && (
+        <LayoutPanel
+          mode={layout}
+          columns={layoutColumns}
+          paneHeight={paneHeight}
+          onMode={setLayout}
+          onColumns={setLayoutColumns}
+          onPaneHeight={setPaneHeight}
+          onClose={() => setLayoutOpen(false)}
+        />
+      )}
     </div>
   );
 }

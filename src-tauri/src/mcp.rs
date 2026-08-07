@@ -21,6 +21,60 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
+    // Keep the injection on one terminal line. Embedded CR/LF characters can
+    // become unintended submit events in a target CLI. Preserve all other
+    // whitespace because quoted commands and code fragments may depend on it.
+    let task = task.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    format!(
+        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} When finished, call the mosaic complete_task tool with task_id \"{task_id}\" and your result."
+    )
+}
+
+/// What a pane is told, in its own terminal, at the moment it becomes conductor.
+///
+/// This is *typed into the composer and left there unsent* — see `set_conductor`
+/// for why. That shapes the text: it has to be short enough to read at a glance
+/// and to type after, because the user is expected to append their actual first
+/// instruction to it and send both together.
+///
+/// So this carries only what MCP cannot: the role is live *now*, and who is
+/// actually running. The playbook — how to write a task, recording decisions
+/// first, subagents versus sessions — is already in BRAIN_INSTRUCTIONS, which
+/// every agent receives on connect. Repeating it here just buried the two facts
+/// that were new.
+fn conductor_briefing(peers: &[String]) -> String {
+    // Single line: a newline lands in most composers as a submit, which would
+    // fire this off half-written — exactly what we are avoiding.
+    let roster = if peers.is_empty() {
+        "No other sessions are open yet (Ctrl+K opens one).".to_string()
+    } else {
+        format!(
+            "Live sessions you can dispatch to: {}.",
+            // Just id and model. `roster_lines` also carries brain= and the
+            // conductor marker, which are useful in list_sessions output but are
+            // noise in a line the user has to read and type around; the agent can
+            // call list_sessions for the full picture.
+            peers
+                .iter()
+                .map(|l| {
+                    let l = l.trim_start_matches("- ").replace('\n', " ");
+                    match l.find(" brain=") {
+                        Some(i) => l[..i].to_string(),
+                        None => l,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+    format!(
+        "[mosaic] You are now the conductor of this workspace. \
+{roster} \
+Each is a live agent idling until you give it work. Use the mosaic dispatch tool rather than doing separable work yourself; it returns immediately, so fan out every independent piece and collect with get_task_result. "
+    )
+}
+
 #[derive(Clone, Serialize)]
 pub struct Entry {
     pub kind: String, // "decision" | "fact" | "broadcast"
@@ -152,9 +206,77 @@ impl Shared {
 
     // ---- conductor ----
 
+    /// One line per live session: id, kind, brain, and role. Shared by
+    /// `list_sessions` and the conductor briefing so an agent sees the same
+    /// picture of the workspace however it asks.
+    ///
+    /// Sorted by (length, text) rather than plain lexical order, which keeps
+    /// `sess-9` ahead of `sess-10`. Session ids come out of a HashMap, so
+    /// without this the roster reshuffles between calls and an agent reading it
+    /// twice cannot tell a reordering from a membership change.
+    pub fn roster_lines(&self) -> Vec<String> {
+        let identified = self.sessions_snapshot();
+        let conductor = self.conductor();
+        let mut ids = self.engine.ids();
+        ids.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        ids.iter()
+            .map(|id| {
+                let kind = identified
+                    .iter()
+                    .find(|a| &a.name == id)
+                    .map(|a| a.kind.clone())
+                    .unwrap_or_else(|| "unidentified".to_string());
+                let room = self.room_for(id);
+                let role = if conductor.as_deref() == Some(id.as_str()) {
+                    " [conductor]"
+                } else {
+                    ""
+                };
+                format!("- {id} ({kind}) brain={room}{role}")
+            })
+            .collect()
+    }
+
+    /// Promote (or, with `None`, demote) a pane.
+    ///
+    /// Promotion also briefs the agent in its own terminal. That injection is
+    /// the whole point rather than a nicety: MCP hands a server's instructions
+    /// to a client once, at connect time, but which pane is the conductor is
+    /// decided by the user long afterwards and can change during a run. An agent
+    /// promoted at minute ten has therefore never been told it now commands
+    /// every other pane, and the observed result is that it just keeps working
+    /// alone. The terminal is the only channel that reaches a *running* agent,
+    /// so the role change is delivered the moment it becomes true.
+    ///
+    /// The briefing is typed into the composer but deliberately NOT submitted.
+    /// Auto-sending it made promotion silently spend a turn on a prompt the user
+    /// never wrote, and left them no way to say what they actually wanted done —
+    /// the pane just started talking. Leaving it unsent turns a hijacked turn
+    /// into a prefilled one: the user appends their real first instruction and
+    /// sends both together, so the agent learns its role and its task at once.
+    /// Dispatch still submits, because there no human is at the keyboard.
     pub fn set_conductor(&self, name: Option<String>) {
-        *self.conductor.lock().unwrap() = name;
+        *self.conductor.lock().unwrap() = name.clone();
         let _ = self.app.emit("conductor-changed", ());
+
+        let Some(target) = name else { return };
+        // A Shell pane has no MCP connection, so it cannot dispatch and the
+        // briefing would land in PowerShell as a command.
+        let is_agent = self
+            .sessions_snapshot()
+            .iter()
+            .any(|s| s.name == target && crate::is_agent_cli(&s.kind));
+        if !is_agent {
+            return;
+        }
+        let peers: Vec<String> = self
+            .roster_lines()
+            .into_iter()
+            .filter(|l| !l.starts_with(&format!("- {target} ")))
+            .collect();
+        // write_to rather than submit_to: no Enter is sent, which also means no
+        // sleep, so this no longer needs a thread of its own.
+        let _ = self.engine.write_to(&target, &conductor_briefing(&peers));
     }
 
     pub fn conductor(&self) -> Option<String> {
@@ -226,6 +348,35 @@ impl Shared {
             t.status = "timeout".to_string();
         }
         Some(t.clone())
+    }
+
+    /// Every task a given agent dispatched, aged out the same way `task_status`
+    /// ages a single one. This is what makes a parallel fan-out cheap to
+    /// collect: without it a conductor holding six task ids has to make six
+    /// round trips to find out that five are still running.
+    fn tasks_from(&self, from: &str) -> Vec<Task> {
+        let mut tasks = self.tasks.lock().unwrap();
+        let now = Self::now_ms();
+        tasks
+            .iter_mut()
+            .filter(|t| t.from == from)
+            .map(|t| {
+                if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_TIMEOUT_MS {
+                    t.status = "timeout".to_string();
+                }
+                t.clone()
+            })
+            .collect()
+    }
+}
+
+/// One task rendered for an agent. Kept in one place so a single-id lookup and
+/// the collect-everything listing never drift apart.
+fn render_task(t: &Task) -> String {
+    if t.status == "done" {
+        format!("[done] {} → {}\n{}", t.target, t.task, t.result)
+    } else {
+        format!("[{}] {} → {}", t.status, t.target, t.task)
     }
 }
 
@@ -340,6 +491,9 @@ pub struct CompleteArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskQuery {
+    /// A single task_id to check. Leave this out to get every task you have
+    /// dispatched, which is the efficient way to collect a parallel fan-out.
+    #[serde(default)]
     pub task_id: String,
 }
 
@@ -430,34 +584,39 @@ impl BrainHandler {
         out
     }
 
-    #[tool(description = "List the live sessions in this workspace — use these ids as dispatch targets.")]
+    #[tool(
+        description = "List the other AI agents live in this workspace right now, with their model/CLI and brain. Call this when you are planning work: if you are the conductor these are real, idle agents you can hand tasks to in parallel via dispatch."
+    )]
     fn list_sessions(&self) -> String {
-        let live = self.shared.engine.ids();
-        if live.is_empty() {
+        let lines = self.shared.roster_lines();
+        if lines.is_empty() {
             return "No live sessions.".to_string();
         }
-        let identified = self.shared.sessions_snapshot();
-        let conductor = self.shared.conductor();
+        let me = self.author();
         let mut out = String::from("# Live sessions\n");
-        for id in live {
-            let kind = identified
-                .iter()
-                .find(|a| a.name == id)
-                .map(|a| a.kind.clone())
-                .unwrap_or_else(|| "unidentified".to_string());
-            let room = self.shared.room_for(&id);
-            let role = if conductor.as_deref() == Some(id.as_str()) {
-                " [conductor]"
-            } else {
-                ""
-            };
-            out.push_str(&format!("- {id} ({kind}) brain={room}{role}\n"));
+        for l in &lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+        // The roster alone reads as passive status. Close with what the caller
+        // can actually do with it, which differs by role.
+        let peers = lines.len().saturating_sub(1);
+        if self.shared.conductor().as_deref() == Some(me.as_str()) {
+            out.push_str(&format!(
+                "\nYou are the conductor: you can dispatch work to any of the other {peers} session(s). \
+                 Dispatch to several before polling, so their work overlaps rather than queues.\n"
+            ));
+        } else {
+            out.push_str(
+                "\nYou are not the conductor, so dispatch will refuse — that is expected. \
+                 You can still reach these agents through record_decision, record_fact and broadcast.\n",
+            );
         }
         out
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live session. The task is typed into that agent's terminal; it reports back with complete_task. Poll get_task_result for the outcome."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id — it does NOT block — so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -488,20 +647,12 @@ impl BrainHandler {
         let uid = uuid::Uuid::new_v4().simple().to_string();
         let id = uid[..6].to_string();
         // Typed into the target's terminal, so the human sees every instruction.
-        let injection = format!(
-            "[mosaic] Task from conductor '{me}' (task_id {id}): {}\r",
-            p.task
-        );
-        if !self.shared.engine.write_to(&p.target, &injection) {
+        // Submit Enter separately: Codex and Claude Code treat text+CR in one
+        // PTY write as a paste and can leave it waiting in the input editor.
+        let injection = dispatch_prompt(&me, &id, &p.task);
+        if !self.shared.engine.submit_to(&p.target, &injection) {
             return "Refused: could not write to that session.".to_string();
         }
-        // Nudge the target to report back, as a second line so it reads cleanly.
-        let _ = self.shared.engine.write_to(
-            &p.target,
-            &format!(
-                "[mosaic] When finished, call the mosaic complete_task tool with task_id \"{id}\" and your result.\r"
-            ),
-        );
 
         self.shared.add_task(Task {
             id: id.clone(),
@@ -527,15 +678,112 @@ impl BrainHandler {
         }
     }
 
-    #[tool(description = "Check a task you dispatched: pending, done (with the result), timed out, or cancelled.")]
+    #[tool(
+        description = "Collect the results of work you dispatched. Call with no task_id to get every task you dispatched at once — do that instead of polling ids one by one. Statuses are pending, done (with the result), timeout or cancelled."
+    )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
-        match self.shared.task_status(&p.task_id) {
-            None => format!("No task '{}'.", p.task_id),
-            Some(t) if t.status == "done" => {
-                format!("[done] {} → {}\n{}", t.target, t.task, t.result)
-            }
-            Some(t) => format!("[{}] {} → {}", t.status, t.target, t.task),
+        if !p.task_id.is_empty() {
+            return match self.shared.task_status(&p.task_id) {
+                None => format!("No task '{}'.", p.task_id),
+                Some(t) => render_task(&t),
+            };
         }
+
+        let mine = self.shared.tasks_from(&self.author());
+        if mine.is_empty() {
+            return "You have not dispatched any tasks.".to_string();
+        }
+        let pending = mine.iter().filter(|t| t.status == "pending").count();
+        let mut out = format!(
+            "# Your dispatched tasks ({} total, {} still running)\n",
+            mine.len(),
+            pending
+        );
+        for t in &mine {
+            out.push_str(&format!("\n## {} → {}\n{}\n", t.id, t.target, render_task(t)));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{conductor_briefing, dispatch_prompt, render_task, Task};
+
+    #[test]
+    fn dispatch_prompt_is_single_line_and_includes_completion_contract() {
+        let prompt = dispatch_prompt("sess-1", "abc123", "audit this\r\nthen report");
+
+        assert!(!prompt.contains(['\r', '\n']));
+        assert!(prompt.contains("audit this then report"));
+        assert!(prompt.contains("task_id \"abc123\""));
+    }
+
+    // Both terminal injections share the same hard constraint: an embedded
+    // newline submits the message to the target CLI in fragments, so the agent
+    // acts on half a briefing. It matters more for the briefing than for a
+    // dispatch, because the briefing is left unsent on purpose — a stray newline
+    // would fire it off before the user has added anything.
+    #[test]
+    fn conductor_briefing_is_single_line_and_names_the_peers() {
+        let peers = vec![
+            "- sess-2 (codex) brain=main".to_string(),
+            "- sess-3 (opencode) brain=main".to_string(),
+        ];
+        let msg = conductor_briefing(&peers);
+
+        assert!(!msg.contains(['\r', '\n']));
+        assert!(msg.contains("sess-2 (codex)"));
+        assert!(msg.contains("sess-3 (opencode)"));
+        assert!(msg.contains("dispatch"));
+    }
+
+    #[test]
+    fn conductor_briefing_survives_an_empty_workspace() {
+        let msg = conductor_briefing(&[]);
+
+        assert!(!msg.contains(['\r', '\n']));
+        assert!(msg.contains("No other sessions are open yet"));
+    }
+
+    // The user has to be able to type their own instruction after it, so it has
+    // to stay short enough to read at a glance. The detail it used to carry now
+    // lives in BRAIN_INSTRUCTIONS, which every agent gets on connect.
+    #[test]
+    fn conductor_briefing_stays_short_enough_to_type_after() {
+        let peers = vec!["- sess-2 (codex) brain=main".to_string()];
+        let msg = conductor_briefing(&peers);
+
+        assert!(
+            msg.len() < 400,
+            "briefing is {} chars; it prefills the composer, so it must stay skimmable",
+            msg.len()
+        );
+        // Trailing space so the user's own text does not run into the last word.
+        assert!(msg.ends_with(' '));
+    }
+
+    #[test]
+    fn render_task_shows_the_result_only_once_done() {
+        let base = Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        };
+        assert!(render_task(&base).starts_with("[pending]"));
+
+        let done = Task {
+            status: "done".into(),
+            result: "found two bugs".into(),
+            ..base
+        };
+        let rendered = render_task(&done);
+        assert!(rendered.starts_with("[done]"));
+        assert!(rendered.contains("found two bugs"));
     }
 }
 
@@ -547,21 +795,38 @@ impl BrainHandler {
 /// instructions on the connection itself, which is why this lives here rather
 /// than in each project's AGENTS.md — it reaches every session automatically,
 /// in whichever repo it was launched against.
-const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, and how they learn what you decide.
+///
+/// The workspace section exists for a second, distinct failure: an agent that
+/// treats Mosaic as a nicer terminal and never notices the other panes are
+/// usable capacity. Because MCP delivers this text once, at connect time, it can
+/// only describe the role an agent *might* be given — the conductor briefing
+/// injected by `set_conductor` is what covers the role it actually has.
+const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
 
 Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
 
-How to work here:
+## The workspace
+
+The other panes are not logs or history. They are live AI coding agents — often different models, each with its own separate context window — sitting idle until given work. Call list_sessions to see who is here.
+
+Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
+
+If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
+- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices — different files or subsystems, separate research questions, a second opinion from a different model — are what the other sessions are for.
+- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
+- Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
+- A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
+- This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
+
+If you are NOT the conductor, dispatch will refuse — that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
+
+## Shared context
 
 - BEFORE making a decision that affects shared work — architecture, dependencies, data models, API shapes, file layout, naming conventions — call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
 - Use search_context to check one specific topic before you spend effort researching it.
-- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here — it is what stops two agents building halves that don't fit together.
+- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here — it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
 - Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
-- Use broadcast for blockers, or anything the others need to know immediately.
-
-If a line appears in your terminal starting with "[mosaic] Task from conductor", that is real work assigned to you. Carry it out, then call complete_task with the task_id you were given and a short summary of the result. The conductor is blocked waiting on that call.
-
-Only the conductor can dispatch work. If you are not the conductor, the dispatch tool will refuse — that is expected, not an error to work around."#;
+- Use broadcast for blockers, or anything the others need to know immediately."#;
 
 #[tool_handler]
 impl ServerHandler for BrainHandler {
