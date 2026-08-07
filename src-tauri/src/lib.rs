@@ -9,6 +9,7 @@
 mod mcp;
 mod worktree;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -200,14 +201,12 @@ impl SessionManager {
         };
         let baseline = clock.load(Ordering::Relaxed);
 
-        let payload;
-        let payload = if is_codex(&program) {
-            payload = format!("{PASTE_START}{prompt}{PASTE_END}");
-            payload.as_str()
+        let payload: Cow<'_, str> = if is_codex(&program) {
+            Cow::Owned(format!("{PASTE_START}{prompt}{PASTE_END}"))
         } else {
-            prompt
+            Cow::Borrowed(prompt)
         };
-        if !self.write_to(id, payload) {
+        if !self.write_to(id, &payload) {
             return false;
         }
 

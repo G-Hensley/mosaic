@@ -209,7 +209,12 @@ function App() {
       const pane = document.querySelectorAll<HTMLElement>(".pane")[index];
       if (!pane) return;
       const id = pane.dataset.paneId;
-      if (id) setFocusedPane((current) => (current && current !== id ? null : current));
+      // While a pane is maximized, move the spotlight to the requested one rather
+      // than dropping out of focus mode. The rail button beside this shortcut
+      // switches panes, and its tooltip advertises the shortcut as the same
+      // action, so exiting instead made the two disagree. Outside focus mode
+      // there is no spotlight to move and the rAF below just focuses the terminal.
+      if (id) setFocusedPane((current) => (current ? id : current));
       requestAnimationFrame(() =>
         requestAnimationFrame(() =>
           pane.querySelector<HTMLElement>(".xterm-helper-textarea")?.focus(),

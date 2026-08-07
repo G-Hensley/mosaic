@@ -52,7 +52,7 @@ Rust, and pnpm.
 1. **Pick project** in the title bar — the git repo agents work in. It is
    remembered between runs, and the shared brain writes its notes to that
    project's `.mosaic/context/`.
-2. **Ctrl+K** opens the launcher. Pick a session type. *Isolate* is on by
+2. **Ctrl+Shift+K** opens the launcher. Pick a session type. *Isolate* is on by
    default, giving that session its own worktree and branch.
 3. **Drag a pane header** onto another pane, or onto a brain in the sidebar, to
    put them in the same brain.
@@ -60,7 +60,7 @@ Rust, and pnpm.
    target's visible terminal, so you see every instruction. **Stop** halts all
    dispatch immediately.
 5. **Layout: scroll** keeps every terminal at a comfortable minimum height and
-   scrolls the cockpit. Open **Layout** to choose automatic or fixed 1–4 column
+   scrolls the cockpit. Open **Layout** to choose automatic or fixed 1–6 column
    arrangements and a minimum pane height, or switch to **Fit window** when you
    want every pane visible at once. **Maximize** expands one pane without stopping
    or remounting the others; use **Restore** to return to the grid.
