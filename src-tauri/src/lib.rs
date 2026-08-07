@@ -33,6 +33,9 @@ struct SessionHandle {
     /// the reader thread, read by `submit_to` to tell when a target has finished
     /// absorbing a pasted prompt. See `SUBMIT_QUIET_MS`.
     last_output: Arc<AtomicU64>,
+    /// The program this session launched, so `submit_to` can tell which CLI it is
+    /// typing into. Only Codex gets bracketed-paste framing; see `PASTE_START`.
+    program: String,
 }
 
 /// Process-monotonic millisecond clock, used to time the gap between a prompt
@@ -83,17 +86,54 @@ const SUBMIT_CEILING_MS: u64 = 4000;
 /// How often to re-check for quiet while waiting.
 const SUBMIT_POLL_MS: u64 = 20;
 
+/// Bracketed paste markers (DECSET 2004). Wrapping a payload in these makes it
+/// one explicit paste event with a defined end, instead of something the target
+/// has to infer from keystroke burst timing — which removes the guesswork the
+/// timing policy above can only approximate.
+///
+/// Applied to Codex alone, deliberately. Codex is the CLI whose burst inference
+/// loses the Enter, and it recommends this framing for itself. Claude Code
+/// already submits reliably, so there is nothing to gain there and a real regression
+/// to risk if it turned out not to honour the markers: an unsupported sequence
+/// does not vanish, it lands in the composer as literal junk. opencode is
+/// verified to support them and can be added once it has been exercised.
+const PASTE_START: &str = "\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
+
+fn is_codex(program: &str) -> bool {
+    let p = program.to_ascii_lowercase();
+    p.trim_end_matches(".exe").trim_end_matches(".cmd") == "codex"
+}
+
 /// Whether the Enter that submits a prompt can be sent yet.
 ///
-/// Split out from the waiting loop so the policy is testable without a live PTY:
-/// hold below the floor, then release as soon as the target goes quiet, and
-/// release unconditionally once the ceiling is reached.
-fn ready_to_submit(now: u64, started: u64, last_output: u64) -> bool {
+/// Split out from the waiting loop so the policy is testable without a live PTY.
+///
+/// `baseline` is the target's output clock sampled *before* the prompt was
+/// written, and comparing against it is what makes this correct. The previous
+/// version asked only "has output been quiet for a while", which a target that
+/// stays silent while it buffers a paste satisfies trivially — its last output
+/// predates the write, so the gap is already enormous and Enter fires the moment
+/// the floor elapses. That is exactly the original bug wearing a new hat, and it
+/// is what a large dispatch to Codex hit: it echoes nothing until its burst
+/// flushes, so "quiet" meant "has not started yet" rather than "has finished".
+///
+/// Silence before the target has produced anything therefore counts as still
+/// receiving. Only once it has actually said something does going quiet mean it
+/// is done, and the ceiling still bounds the wait if it never speaks at all.
+fn ready_to_submit(now: u64, started: u64, last_output: u64, baseline: u64) -> bool {
     let waited = now.saturating_sub(started);
+    // Checked first so a silent target is always released eventually.
+    if waited >= SUBMIT_CEILING_MS {
+        return true;
+    }
     if waited < SUBMIT_FLOOR_MS {
         return false;
     }
-    waited >= SUBMIT_CEILING_MS || now.saturating_sub(last_output) >= SUBMIT_QUIET_MS
+    if last_output == baseline {
+        return false;
+    }
+    now.saturating_sub(last_output) >= SUBMIT_QUIET_MS
 }
 
 #[derive(Default)]
@@ -128,13 +168,13 @@ impl SessionManager {
         false
     }
 
-    /// The session's output-activity clock, if it is still live.
-    fn output_clock(&self, id: &str) -> Option<Arc<AtomicU64>> {
+    /// The session's output-activity clock and launched program, if it is live.
+    fn session_meta(&self, id: &str) -> Option<(Arc<AtomicU64>, String)> {
         self.sessions
             .lock()
             .unwrap()
             .get(id)
-            .map(|h| h.last_output.clone())
+            .map(|h| (h.last_output.clone(), h.program.clone()))
     }
 
     /// Submit a prompt to a terminal UI as typing followed by a distinct Enter
@@ -153,20 +193,29 @@ impl SessionManager {
     /// A `true` return therefore means "delivered to the terminal", not "already
     /// submitted".
     pub fn submit_to(self: &Arc<Self>, id: &str, prompt: &str) -> bool {
-        if !self.write_to(id, prompt) {
-            return false;
-        }
-        // Captured before the wait so a session that dies mid-wait simply fails
-        // the final write rather than resurrecting a map entry.
-        let Some(clock) = self.output_clock(id) else {
+        // Resolved before the write so the output clock can be sampled first:
+        // the baseline is only meaningful if it predates the prompt.
+        let Some((clock, program)) = self.session_meta(id) else {
             return false;
         };
+        let baseline = clock.load(Ordering::Relaxed);
+
+        let payload;
+        let payload = if is_codex(&program) {
+            payload = format!("{PASTE_START}{prompt}{PASTE_END}");
+            payload.as_str()
+        } else {
+            prompt
+        };
+        if !self.write_to(id, payload) {
+            return false;
+        }
 
         let engine = self.clone();
         let id = id.to_string();
         thread::spawn(move || {
             let started = mono_ms();
-            while !ready_to_submit(mono_ms(), started, clock.load(Ordering::Relaxed)) {
+            while !ready_to_submit(mono_ms(), started, clock.load(Ordering::Relaxed), baseline) {
                 thread::sleep(Duration::from_millis(SUBMIT_POLL_MS));
             }
             engine.write_to(&id, "\r");
@@ -448,6 +497,7 @@ async fn spawn_session(
                 child,
                 worktree: wt,
                 last_output: activity.clone(),
+                program: program.clone(),
             },
         );
         reader
@@ -632,51 +682,77 @@ fn halt_conductor(shared: State<'_, Arc<mcp::Shared>>, halted: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ready_to_submit, SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS};
+    use super::{is_codex, ready_to_submit, SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS};
 
     // A dispatch is only lost in one direction: an Enter sent too early is
     // swallowed silently, while one sent late costs nothing but a pause. Every
     // case below is therefore written from the "hold unless certain" side.
+    //
+    // `baseline` is the output clock as of the write. Cases where it still equals
+    // `last_output` are the target not having reacted yet.
+
+    // Stands in for the output clock as of the write. Kept below the `now` values
+    // used here so the cases stay arithmetically honest.
+    const BASE: u64 = 100;
 
     #[test]
-    fn holds_below_the_floor_even_when_the_target_is_silent() {
-        // Silent target, floor not yet reached. The old fixed delay is the floor,
-        // so this is also what stops short prompts regressing.
-        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, 0));
+    fn holds_below_the_floor() {
+        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, BASE + 1, BASE));
+    }
+
+    // The regression that shipped: a target which stays silent while it buffers a
+    // paste has a last-output timestamp predating the write, so "quiet for long
+    // enough" was true the instant the floor elapsed and Enter fired straight into
+    // the paste. Silence before the target has said anything must not count.
+    #[test]
+    fn holds_while_a_silent_target_has_not_reacted_to_the_write_yet() {
+        // Inside the ceiling window, so this isolates the has-it-reacted rule
+        // rather than the backstop that eventually overrides it.
+        let now = SUBMIT_FLOOR_MS + 500;
+        assert!(now < SUBMIT_CEILING_MS);
+        // Stale by design: the target has produced nothing since before the write,
+        // so an elapsed-quiet check alone would read this as "finished" and fire.
+        assert!(now - BASE >= SUBMIT_QUIET_MS);
+        assert!(!ready_to_submit(now, 0, BASE, BASE));
     }
 
     #[test]
-    fn submits_once_past_the_floor_and_the_target_has_gone_quiet() {
+    fn submits_once_the_target_has_spoken_and_then_gone_quiet() {
         let now = SUBMIT_FLOOR_MS + SUBMIT_QUIET_MS;
         let last_output = now - SUBMIT_QUIET_MS;
-        assert!(ready_to_submit(now, 0, last_output));
+        assert!(last_output != BASE);
+        assert!(ready_to_submit(now, 0, last_output, BASE));
     }
 
     #[test]
     fn holds_while_the_target_is_still_producing_output() {
-        // This is the 1946-character dispatch that failed: past the old 300 ms
-        // delay, but ConPTY is still delivering and Codex keeps re-anchoring its
-        // suppress window. The fixed-sleep implementation fired Enter here.
         let now = SUBMIT_FLOOR_MS + 500;
-        let last_output = now - 10;
-        assert!(!ready_to_submit(now, 0, last_output));
+        assert!(!ready_to_submit(now, 0, now - 10, BASE));
     }
 
     #[test]
-    fn submits_at_the_ceiling_even_if_the_target_never_goes_quiet() {
-        // A target already mid-task streams output forever; the dispatch must
-        // still be delivered rather than waiting indefinitely.
-        let now = SUBMIT_CEILING_MS;
-        assert!(ready_to_submit(now, 0, now));
+    fn submits_at_the_ceiling_even_if_the_target_never_speaks() {
+        // Backstop for a CLI that echoes nothing at all: without this the
+        // has-it-reacted rule would hold the Enter forever.
+        assert!(ready_to_submit(SUBMIT_CEILING_MS, 0, BASE, BASE));
     }
 
     #[test]
     fn quiet_is_measured_from_the_last_output_not_from_the_write() {
-        // Same elapsed wait in both cases; only the target's activity differs.
-        // That difference is the entire point of the change.
-        let now = SUBMIT_FLOOR_MS + 1000;
-        assert!(ready_to_submit(now, 0, now - SUBMIT_QUIET_MS));
-        assert!(!ready_to_submit(now, 0, now - (SUBMIT_QUIET_MS - 1)));
+        let now = SUBMIT_FLOOR_MS + 1_000;
+        assert!(ready_to_submit(now, 0, now - SUBMIT_QUIET_MS, BASE));
+        assert!(!ready_to_submit(now, 0, now - (SUBMIT_QUIET_MS - 1), BASE));
+    }
+
+    #[test]
+    fn only_codex_is_framed_as_a_bracketed_paste() {
+        assert!(is_codex("codex"));
+        assert!(is_codex("Codex.cmd"));
+        assert!(is_codex("CODEX.EXE"));
+        // Claude Code already submits reliably and must keep its plain path.
+        assert!(!is_codex("claude"));
+        assert!(!is_codex("opencode"));
+        assert!(!is_codex("powershell.exe"));
     }
 }
 
