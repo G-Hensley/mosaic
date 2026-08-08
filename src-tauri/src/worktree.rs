@@ -75,7 +75,8 @@ fn base_dir() -> PathBuf {
 
 /// Internal helper: create a worktree using a specific base directory.
 /// Used by tests to keep worktrees inside a temp directory.
-fn create_with_base_dir(
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn create_with_base_dir(
     repo: &Path,
     session_id: &str,
     base_dir: &Path,
@@ -154,6 +155,13 @@ pub fn remove(wt: &Worktree) -> Result<RemoveOutcome, String> {
     Ok(RemoveOutcome::Removed)
 }
 
+/// Git fixture shared by this module's tests and the spawn-rollback tests in
+/// `lib.rs`, which need a real worktree to assert cleanup against.
+#[cfg(test)]
+pub(crate) fn init_test_repo(dir: &Path) -> Result<(), String> {
+    tests::init_repo(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +169,7 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    fn init_repo(dir: &Path) -> Result<(), String> {
+    pub(super) fn init_repo(dir: &Path) -> Result<(), String> {
         Command::new("git")
             .args(["init"])
             .current_dir(dir)

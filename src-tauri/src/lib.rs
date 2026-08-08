@@ -37,6 +37,10 @@ struct SessionHandle {
     /// The program this session launched, so `submit_to` can tell which CLI it is
     /// typing into. Only Codex gets bracketed-paste framing; see `PASTE_START`.
     program: String,
+    /// This session's dedicated MCP listener. Present unless the endpoint failed
+    /// and the session fell back to the shared one. Aborted on teardown; without
+    /// this, one listener leaks per session for the life of the app.
+    server: Option<mcp::SessionServer>,
 }
 
 /// Process-monotonic millisecond clock, used to time the gap between a prompt
@@ -159,14 +163,75 @@ fn report_worktree_cleanup(worktree: &worktree::Worktree) {
     }
 }
 
+/// Release everything a live session owns. Shared by explicit kill and by the
+/// natural-exit path so the two cannot drift apart — they previously cleaned up
+/// slightly different sets of resources.
+fn release_session(session_id: &str, handle: SessionHandle) {
+    if let Some(server) = handle.server {
+        server.shutdown();
+    }
+    if let Some(worktree) = &handle.worktree {
+        report_worktree_cleanup(worktree);
+    }
+    let _ = std::fs::remove_dir_all(session_config_dir(session_id));
+}
+
+/// Owns what a spawn creates before a `SessionHandle` exists to own it: the
+/// worktree, the per-session config dir, and the dedicated MCP listener.
+/// `spawn_session` can still return early after those are in place (opening the
+/// PTY or spawning the child can fail), and dropping this guard tears them back
+/// down. Without it a failed spawn strands a worktree, a branch, a config
+/// directory, and a live loopback listener with no session attached to any of it.
+///
+/// Disarmed by `into_session` at the moment the `SessionHandle` takes over.
+struct SpawnRollback {
+    session_id: String,
+    worktree: Option<worktree::Worktree>,
+    server: Option<mcp::SessionServer>,
+    armed: bool,
+}
+
+impl SpawnRollback {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            worktree: None,
+            server: None,
+            armed: true,
+        }
+    }
+
+    /// Hand the resources to the session that now owns them, cancelling cleanup.
+    fn into_session(mut self) -> (Option<worktree::Worktree>, Option<mcp::SessionServer>) {
+        self.armed = false;
+        (self.worktree.take(), self.server.take())
+    }
+}
+
+impl Drop for SpawnRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        eprintln!(
+            "[mosaic] spawn failed for {}, rolling back",
+            self.session_id
+        );
+        if let Some(server) = self.server.take() {
+            server.shutdown();
+        }
+        if let Some(worktree) = &self.worktree {
+            report_worktree_cleanup(worktree);
+        }
+        let _ = std::fs::remove_dir_all(session_config_dir(&self.session_id));
+    }
+}
+
 impl SessionManager {
     fn kill(&self, id: &str) {
         if let Some(mut h) = self.sessions.lock().unwrap().remove(id) {
             let _ = h.child.kill();
-            if let Some(wt) = &h.worktree {
-                report_worktree_cleanup(wt);
-            }
-            let _ = std::fs::remove_dir_all(session_config_dir(id));
+            release_session(id, h);
         }
     }
 
@@ -463,13 +528,15 @@ async fn spawn_session(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let mut session_cwd = project.clone();
-    let mut wt: Option<worktree::Worktree> = None;
+    // Everything created from here until the SessionHandle exists is owned by this
+    // guard, so any early return below unwinds it instead of stranding it.
+    let mut rollback = SpawnRollback::new(session_id.clone());
     if isolate.unwrap_or(false) {
         if let Some(root) = worktree::repo_root(&project) {
             match worktree::create(&root, &session_id) {
                 Ok(w) => {
                     session_cwd = w.path.clone();
-                    wt = Some(w);
+                    rollback.worktree = Some(w);
                 }
                 // Fall back to the project dir rather than failing the launch.
                 Err(e) => eprintln!("[mosaic] worktree create failed: {e}"),
@@ -484,9 +551,11 @@ async fn spawn_session(
     // "unknown", which silently breaks brain assignment and the conductor.
     let (extra_args, extra_env) =
         match mcp::start_session_server(shared.inner().clone(), session_id.clone()) {
-            Ok(p) => {
+            Ok(server) => {
+                let url = format!("http://127.0.0.1:{}/mcp", server.port);
+                rollback.server = Some(server);
                 shared.note_session(&session_id, &program);
-                agent_mcp_wiring(&program, &session_id, &format!("http://127.0.0.1:{p}/mcp"))
+                agent_mcp_wiring(&program, &session_id, &url)
             }
             // Endpoint failed: fall back to the shared one. The agent can still reach
             // the brain, it just has to declare who it is.
@@ -516,6 +585,13 @@ async fn spawn_session(
             })
             .map_err(|e| e.to_string())?;
 
+        // Take the reader and writer BEFORE spawning. Both can fail, and spawning
+        // is the one step here that is not undoable — doing it last means a
+        // failure never leaves a live child process behind for the guard to
+        // reap, so the rollback only ever has inert resources to clean up.
+        let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+
         let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
         // The agent's Mosaic name = its session id, so the collab skill can
         // self-identify and the app can map it to a brain.
@@ -523,18 +599,19 @@ async fn spawn_session(
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave); // so the reader hits EOF when the child exits
 
-        let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-
+        // The session owns the worktree and listener from here on, so the guard
+        // stands down. Nothing below this point can fail before insertion.
+        let (worktree, server) = rollback.into_session();
         state.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
                 master: pair.master,
                 writer,
                 child,
-                worktree: wt,
+                worktree,
                 last_output: activity.clone(),
                 program: program.clone(),
+                server,
             },
         );
         reader
@@ -580,15 +657,16 @@ async fn spawn_session(
 
     // Session ended on its own (agent quit or crashed). Tear down exactly what
     // an explicit kill would: dropping the handle alone would discard the
-    // Worktree without removing it, stranding a directory and a branch on disk
-    // for every session that wasn't closed by hand.
+    // Worktree without removing it and leave the session's MCP listener serving,
+    // stranding a directory, a branch, and a port for every session that wasn't
+    // closed by hand.
     let handle = state.sessions.lock().unwrap().remove(&session_id);
     if let Some(h) = handle {
-        if let Some(w) = &h.worktree {
-            report_worktree_cleanup(w);
-        }
+        release_session(&session_id, h);
+    } else {
+        // Already removed by an explicit kill, which cleaned the rest.
+        let _ = std::fs::remove_dir_all(session_config_dir(&session_id));
     }
-    let _ = std::fs::remove_dir_all(session_config_dir(&session_id));
     let _ = app.emit("session-exited", &session_id);
     Ok(())
 }
@@ -760,9 +838,77 @@ fn human_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_agent_cli, is_codex, ready_to_submit, validate_human_dispatch, SUBMIT_CEILING_MS,
-        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        is_agent_cli, is_codex, ready_to_submit, validate_human_dispatch, worktree, SpawnRollback,
+        SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A temp repo plus one worktree created inside it, standing in for the state
+    /// a spawn has already built when a later step fails.
+    fn worktree_fixture(tmp: &TempDir, session_id: &str) -> worktree::Worktree {
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        worktree::init_test_repo(&repo).unwrap();
+        worktree::create_with_base_dir(&repo, session_id, tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn an_armed_rollback_removes_the_worktree_a_failed_spawn_left_behind() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-rollback-armed");
+        let path = wt.path.clone();
+        assert!(path.exists(), "fixture should start on disk");
+
+        {
+            let mut rollback = SpawnRollback::new("sess-rollback-armed".into());
+            rollback.worktree = Some(wt);
+            // Dropped here, standing in for an early return from spawn_session.
+        }
+
+        assert!(!path.exists(), "rollback should remove the worktree");
+    }
+
+    #[test]
+    fn a_rollback_disarmed_by_into_session_leaves_the_worktree_alone() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-rollback-disarmed");
+        let path = wt.path.clone();
+
+        let handed_over = {
+            let mut rollback = SpawnRollback::new("sess-rollback-disarmed".into());
+            rollback.worktree = Some(wt);
+            let (worktree, _server) = rollback.into_session();
+            worktree
+        };
+
+        assert!(
+            path.exists(),
+            "a session that spawned successfully must keep its worktree"
+        );
+        assert!(
+            handed_over.is_some(),
+            "the worktree should be handed to the SessionHandle, not dropped"
+        );
+    }
+
+    #[test]
+    fn rollback_preserves_a_worktree_that_already_has_uncommitted_work() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-rollback-dirty");
+        let path = wt.path.clone();
+        fs::write(path.join("in-progress.txt"), "unsaved").unwrap();
+
+        {
+            let mut rollback = SpawnRollback::new("sess-rollback-dirty".into());
+            rollback.worktree = Some(wt);
+        }
+
+        assert!(
+            path.join("in-progress.txt").exists(),
+            "rollback must not discard uncommitted work"
+        );
+    }
 
     // A dispatch is only lost in one direction: an Enter sent too early is
     // swallowed silently, while one sent late costs nothing but a pause. Every
