@@ -204,8 +204,9 @@ cd ..
 pnpm build         # tsc in strict mode, then the Vite production build
 ```
 
-Neither is wired into CI yet (see [CONTRIBUTING.md](CONTRIBUTING.md)), so run
-both locally before relying on a change.
+CI runs both on every pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)),
+along with `cargo fmt --check`, `cargo clippy`, and dependency audits. Run them
+locally first so review starts from a green branch.
 
 ## Contributing and security
 

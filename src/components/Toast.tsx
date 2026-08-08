@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type ConductorTask } from "../lib/ipc";
 
 type ToastProps = {
@@ -9,13 +9,24 @@ type ToastProps = {
 function Toast({ task, onDismiss }: ToastProps) {
   const [visible, setVisible] = useState(true);
 
+  // Held in a ref so polling that hands us a fresh `task` object or a new
+  // `onDismiss` identity cannot restart the countdown mid-flight.
+  const onDismissRef = useRef(onDismiss);
   useEffect(() => {
+    onDismissRef.current = onDismiss;
+  }, [onDismiss]);
+
+  useEffect(() => {
+    let fadeTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
       setVisible(false);
-      setTimeout(() => onDismiss(task.id), 300);
+      fadeTimer = setTimeout(() => onDismissRef.current(task.id), 300);
     }, 6000);
-    return () => clearTimeout(timer);
-  }, [task, onDismiss]);
+    return () => {
+      clearTimeout(timer);
+      if (fadeTimer !== undefined) clearTimeout(fadeTimer);
+    };
+  }, [task.id]);
 
   if (!visible) return null;
 

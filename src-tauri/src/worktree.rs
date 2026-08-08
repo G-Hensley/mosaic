@@ -51,8 +51,8 @@ fn git_ok(args: &[&str]) -> bool {
 }
 
 /// Check if a worktree has uncommitted changes (dirty working tree or untracked files).
-fn is_dirty(repo: &Path, worktree_path: &Path) -> Result<bool, String> {
-    let _repo_s = repo.to_string_lossy().to_string();
+/// Runs against the worktree itself; the parent repo is irrelevant here.
+fn is_dirty(worktree_path: &Path) -> Result<bool, String> {
     let path_s = worktree_path.to_string_lossy().to_string();
     // --porcelain gives machine-readable output; empty = clean.
     let status = git_out(&["-C", &path_s, "status", "--porcelain"])?;
@@ -134,12 +134,13 @@ pub fn remove(wt: &Worktree) -> Result<RemoveOutcome, String> {
     }
 
     // Check for uncommitted changes before doing anything destructive.
-    if is_dirty(&wt.repo, &wt.path)? {
+    if is_dirty(&wt.path)? {
         return Ok(RemoveOutcome::RefusedDirty);
     }
 
     // Clean: remove the worktree (force is safe now that we know it's clean).
-    let _ = git_ok(&["-C", &repo, "worktree", "remove", "--force", &path]);
+    // Surface git's own stderr rather than reporting a removal that never happened.
+    git_out(&["-C", &repo, "worktree", "remove", "--force", &path])?;
 
     // Delete the branch only if it has no commits of its own.
     let range = format!("{}..{}", wt.base, wt.branch);
@@ -299,7 +300,7 @@ mod tests {
         // Create an untracked file (not added to git)
         fs::write(wt.path.join("untracked.txt"), "untracked").unwrap();
 
-        assert!(is_dirty(&wt.repo, &wt.path).unwrap());
+        assert!(is_dirty(&wt.path).unwrap());
     }
 
     #[test]
@@ -313,7 +314,7 @@ mod tests {
         // Modify a tracked file
         fs::write(wt.path.join("README.md"), "# Modified\n").unwrap();
 
-        assert!(is_dirty(&wt.repo, &wt.path).unwrap());
+        assert!(is_dirty(&wt.path).unwrap());
     }
 
     #[test]
@@ -325,6 +326,6 @@ mod tests {
 
         let wt = create_test_wt(&repo, "sess-test", &tmp);
         // No changes
-        assert!(!is_dirty(&wt.repo, &wt.path).unwrap());
+        assert!(!is_dirty(&wt.path).unwrap());
     }
 }
