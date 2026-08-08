@@ -521,6 +521,15 @@ async fn spawn_session(
     cwd: Option<String>,
     isolate: Option<bool>,
 ) -> Result<(), String> {
+    // Refuse a session id that is already live. Inserting over one would replace
+    // the handle without killing the process or removing its worktree, orphaning
+    // both. This early check only saves work — it cannot be authoritative,
+    // because nothing stops a second spawn passing it before the first inserts.
+    // The binding check is inside the spawn lock below.
+    if state.sessions.lock().unwrap().contains_key(&session_id) {
+        return Err(format!("session {session_id} is already running"));
+    }
+
     // Decide where this session runs: the project dir, or its own git worktree
     // when isolated. Done before taking the spawn lock — creating a worktree and
     // registering MCP takes seconds and shouldn't serialize other spawns.
@@ -591,6 +600,15 @@ async fn spawn_session(
         // reap, so the rollback only ever has inert resources to clean up.
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+
+        // The authoritative duplicate check. `spawn_lock` serializes this whole
+        // block, so no other spawn can insert between here and the insertion
+        // below — which makes check-then-insert atomic against them. It sits
+        // before the spawn deliberately: losing this race must not leave a live
+        // child behind, and the rollback guard only handles inert resources.
+        if state.sessions.lock().unwrap().contains_key(&session_id) {
+            return Err(format!("session {session_id} is already running"));
+        }
 
         let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
         // The agent's Mosaic name = its session id, so the collab skill can
