@@ -145,12 +145,26 @@ pub struct SessionManager {
     spawn_lock: Mutex<()>,
 }
 
+fn report_worktree_cleanup(worktree: &worktree::Worktree) {
+    match worktree::remove(worktree) {
+        Ok(worktree::RemoveOutcome::RefusedDirty) => eprintln!(
+            "[mosaic] preserved dirty worktree at {}",
+            worktree.path.display()
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "[mosaic] worktree cleanup failed for {}: {error}",
+            worktree.path.display()
+        ),
+    }
+}
+
 impl SessionManager {
     fn kill(&self, id: &str) {
         if let Some(mut h) = self.sessions.lock().unwrap().remove(id) {
             let _ = h.child.kill();
             if let Some(wt) = &h.worktree {
-                worktree::remove(wt);
+                report_worktree_cleanup(wt);
             }
             let _ = std::fs::remove_dir_all(session_config_dir(id));
         }
@@ -227,6 +241,19 @@ impl SessionManager {
         self.sessions.lock().unwrap().keys().cloned().collect()
     }
 
+    /// The program a live session launched, if it's still live — lets a
+    /// caller (here, `human_dispatch`) tell an agent CLI target from a plain
+    /// shell without going through the MCP-side session list, which may not
+    /// have an entry yet if the session's dedicated endpoint failed to bind
+    /// (see the fallback path in `spawn_session`).
+    pub fn program_of(&self, id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|h| h.program.clone())
+    }
+
     /// Kill every session — used on window close so no agent process is orphaned
     /// and no worktree is left behind.
     fn kill_all(&self) {
@@ -234,7 +261,7 @@ impl SessionManager {
         for (id, mut h) in map.drain() {
             let _ = h.child.kill();
             if let Some(wt) = &h.worktree {
-                worktree::remove(wt);
+                report_worktree_cleanup(wt);
             }
             let _ = std::fs::remove_dir_all(session_config_dir(&id));
         }
@@ -316,6 +343,22 @@ pub fn is_agent_cli(program: &str) -> bool {
     matches!(p, "claude" | "codex" | "opencode")
 }
 
+/// Trim and validate the `human_dispatch` inputs, so the rule is the same
+/// whether the emptiness comes from the UI or a caller invoking the command
+/// directly. Pure and separate from the Tauri command so it's testable
+/// without constructing app state.
+fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String), String> {
+    let target = target.trim();
+    let task = task.trim();
+    if target.is_empty() {
+        return Err("target is required.".to_string());
+    }
+    if task.is_empty() {
+        return Err("task text is required.".to_string());
+    }
+    Ok((target.to_string(), task.to_string()))
+}
+
 /// Point ONE agent CLI at ONE dedicated MCP endpoint, entirely through launch
 /// arguments and environment — we never touch the user's global config.
 ///
@@ -349,9 +392,7 @@ fn agent_mcp_wiring(
         // argument added after this one would be swallowed as a config file.
         "claude" => {
             let path = dir.join("claude-mcp.json");
-            let body = format!(
-                r#"{{"mcpServers":{{"mosaic":{{"type":"http","url":"{url}"}}}}}}"#
-            );
+            let body = format!(r#"{{"mcpServers":{{"mosaic":{{"type":"http","url":"{url}"}}}}}}"#);
             match std::fs::write(&path, body) {
                 Ok(_) => (
                     vec![
@@ -369,10 +410,7 @@ fn agent_mcp_wiring(
         // A bare value fails TOML parsing, at which point Codex documents that it
         // falls back to the raw string — which sidesteps nested quoting.
         "codex" => (
-            vec![
-                "-c".to_string(),
-                format!("mcp_servers.mosaic.url={url}"),
-            ],
+            vec!["-c".to_string(), format!("mcp_servers.mosaic.url={url}")],
             vec![],
         ),
         // OPENCODE_CONFIG is merged over the global config, not swapped for it.
@@ -444,19 +482,19 @@ async fn spawn_session(
     // provably from it — so identity needs no handshake and can't be spoofed or
     // forgotten. Sessions sharing one endpoint would all authenticate as
     // "unknown", which silently breaks brain assignment and the conductor.
-    let (extra_args, extra_env) = match mcp::start_session_server(shared.inner().clone(), session_id.clone())
-    {
-        Ok(p) => {
-            shared.note_session(&session_id, &program);
-            agent_mcp_wiring(&program, &session_id, &format!("http://127.0.0.1:{p}/mcp"))
-        }
-        // Endpoint failed: fall back to the shared one. The agent can still reach
-        // the brain, it just has to declare who it is.
-        Err(e) => {
-            eprintln!("[mosaic] session endpoint failed, using shared: {e}");
-            agent_mcp_wiring(&program, &session_id, &mcp.url)
-        }
-    };
+    let (extra_args, extra_env) =
+        match mcp::start_session_server(shared.inner().clone(), session_id.clone()) {
+            Ok(p) => {
+                shared.note_session(&session_id, &program);
+                agent_mcp_wiring(&program, &session_id, &format!("http://127.0.0.1:{p}/mcp"))
+            }
+            // Endpoint failed: fall back to the shared one. The agent can still reach
+            // the brain, it just has to declare who it is.
+            Err(e) => {
+                eprintln!("[mosaic] session endpoint failed, using shared: {e}");
+                agent_mcp_wiring(&program, &session_id, &mcp.url)
+            }
+        };
     let mut args = args;
     args.extend(extra_args);
 
@@ -547,7 +585,7 @@ async fn spawn_session(
     let handle = state.sessions.lock().unwrap().remove(&session_id);
     if let Some(h) = handle {
         if let Some(w) = &h.worktree {
-            worktree::remove(w);
+            report_worktree_cleanup(w);
         }
     }
     let _ = std::fs::remove_dir_all(session_config_dir(&session_id));
@@ -679,9 +717,52 @@ fn halt_conductor(shared: State<'_, Arc<mcp::Shared>>, halted: bool) {
     shared.set_halted(halted);
 }
 
+/// Let a human dispatch a task to a live agent session directly from the UI,
+/// instead of only through an agent calling the MCP `dispatch` tool. Reuses
+/// the exact submit machinery and task store that tool uses — see
+/// `mcp::Shared::dispatch_task` — so the ConductorBar and get_task_result see
+/// one ledger regardless of which path started the task.
+///
+/// Attributed to the current conductor rather than to some "user" identity:
+/// the app is what decides who holds that role, and a task the human triggers
+/// through the UI is still work the conductor is orchestrating, so it belongs
+/// on the same ledger the conductor's own dispatches land on.
+#[tauri::command]
+fn human_dispatch(
+    state: State<'_, Arc<SessionManager>>,
+    shared: State<'_, Arc<mcp::Shared>>,
+    target: String,
+    task: String,
+) -> Result<mcp::DispatchOutcome, String> {
+    let (target, task) = validate_human_dispatch(&target, &task)?;
+
+    let from = shared
+        .conductor()
+        .ok_or_else(|| "no conductor is set — promote a pane first.".to_string())?;
+
+    // Only a live agent CLI can act on a dispatch: it needs the MCP
+    // connection to read the task and call complete_task back. A Shell pane
+    // has neither, so a dispatch to one would just sit pending until it
+    // timed out.
+    match state.program_of(&target) {
+        Some(p) if is_agent_cli(&p) => {}
+        Some(_) => {
+            return Err(format!(
+                "'{target}' is a shell session and cannot receive a dispatch."
+            ))
+        }
+        None => return Err(format!("no live session '{target}'.")),
+    }
+
+    shared.dispatch_task(&from, &target, &task)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_codex, ready_to_submit, SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS};
+    use super::{
+        is_agent_cli, is_codex, ready_to_submit, validate_human_dispatch, SUBMIT_CEILING_MS,
+        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+    };
 
     // A dispatch is only lost in one direction: an Enter sent too early is
     // swallowed silently, while one sent late costs nothing but a pause. Every
@@ -753,6 +834,27 @@ mod tests {
         assert!(!is_codex("opencode"));
         assert!(!is_codex("powershell.exe"));
     }
+
+    #[test]
+    fn is_agent_cli_recognizes_the_wired_clis_and_excludes_shells() {
+        assert!(is_agent_cli("claude"));
+        assert!(is_agent_cli("Codex.cmd"));
+        assert!(is_agent_cli("OPENCODE.EXE"));
+        assert!(!is_agent_cli("powershell.exe"));
+        assert!(!is_agent_cli("cmd"));
+        assert!(!is_agent_cli("bash"));
+    }
+
+    #[test]
+    fn validate_human_dispatch_trims_and_requires_both_fields() {
+        assert_eq!(
+            validate_human_dispatch("  sess-2  ", "  do the thing  ").unwrap(),
+            ("sess-2".to_string(), "do the thing".to_string())
+        );
+        assert!(validate_human_dispatch("", "task").is_err());
+        assert!(validate_human_dispatch("sess-2", "   ").is_err());
+        assert!(validate_human_dispatch("   ", "").is_err());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -796,7 +898,8 @@ pub fn run() {
             conductor_state,
             set_conductor,
             halt_conductor,
-            set_project
+            set_project,
+            human_dispatch
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

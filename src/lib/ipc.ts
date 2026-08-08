@@ -89,7 +89,7 @@ export type ConductorTask = {
   from: string;
   target: string;
   task: string;
-  status: string; // pending | done | timeout | cancelled
+  status: string; // pending | done | error | timeout | cancelled
   result: string;
   ts_ms: number;
 };
@@ -104,3 +104,7 @@ export const setConductor = (name: string | null): Promise<void> =>
   invoke("set_conductor", { name });
 export const haltConductor = (halted: boolean): Promise<void> =>
   invoke("halt_conductor", { halted });
+
+// ---- Dispatch (human-initiated) ----
+export const dispatchTask = (target: string, task: string): Promise<{ task_id: string }> =>
+  invoke("human_dispatch", { target, task });

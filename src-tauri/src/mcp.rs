@@ -12,10 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,7 @@ pub struct Task {
     pub from: String,
     pub target: String,
     pub task: String,
-    /// "pending" | "done" | "timeout" | "cancelled"
+    /// "pending" | "done" | "timeout" | "cancelled" | "error"
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
@@ -108,6 +108,45 @@ pub struct Task {
 /// dispatch, so a dispatched agent cannot dispatch onward.
 const MAX_DISPATCHES: u32 = 40;
 const TASK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+/// A task record was created and delivery was attempted. `delivered` is false
+/// when the prompt could not be written to the target's terminal — the task
+/// still exists, in "error" status, rather than vanishing silently the way a
+/// failed dispatch used to.
+#[derive(Clone, Serialize)]
+pub struct DispatchOutcome {
+    pub task_id: String,
+    pub delivered: bool,
+}
+
+/// The checks a dispatch must pass before any task record is created, in the
+/// order they're applied — that order is what decides which message wins when
+/// more than one would refuse. Kept pure (no lock, no I/O) so it's testable
+/// without a live `Shared`, which needs a real `AppHandle` to construct.
+///
+/// The dispatch budget is deliberately NOT one of these checks: consuming it
+/// has to be atomic with checking it (or two concurrent dispatches could both
+/// pass), so `dispatch_task` calls `take_dispatch_budget` itself, last, under
+/// its own lock.
+fn dispatch_precheck(
+    halted: bool,
+    from: &str,
+    target: &str,
+    target_is_live: bool,
+) -> Result<(), String> {
+    if halted {
+        return Err("dispatch is halted by the user (Stop). Do not retry.".to_string());
+    }
+    if target == from {
+        return Err("cannot dispatch to yourself.".to_string());
+    }
+    if !target_is_live {
+        return Err(format!(
+            "no live session '{target}'. Call list_sessions for valid targets."
+        ));
+    }
+    Ok(())
+}
 
 /// The shared store — one instance, cloned by Arc into every agent's handler.
 pub struct Shared {
@@ -322,21 +361,20 @@ impl Shared {
     }
 
     fn finish_task(&self, id: &str, result: &str) -> bool {
-        let found = {
-            let mut tasks = self.tasks.lock().unwrap();
-            match tasks.iter_mut().find(|t| t.id == id && t.status == "pending") {
-                Some(t) => {
-                    t.status = "done".to_string();
-                    t.result = result.to_string();
-                    true
-                }
-                None => false,
-            }
-        };
+        let found = finish_pending(&mut self.tasks.lock().unwrap(), id, result);
         if found {
             let _ = self.app.emit("conductor-changed", ());
         }
         found
+    }
+
+    /// Mark a recorded task as errored when terminal delivery fails. A task
+    /// that completed or was cancelled concurrently is never overwritten.
+    fn mark_delivery_failed(&self, id: &str) {
+        let changed = mark_pending_error(&mut self.tasks.lock().unwrap(), id);
+        if changed {
+            let _ = self.app.emit("conductor-changed", ());
+        }
     }
 
     /// Look a task up, flipping it to "timeout" if it has aged out.
@@ -344,9 +382,7 @@ impl Shared {
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
         let t = tasks.iter_mut().find(|t| t.id == id)?;
-        if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_TIMEOUT_MS {
-            t.status = "timeout".to_string();
-        }
+        age(t, now);
         Some(t.clone())
     }
 
@@ -361,12 +397,100 @@ impl Shared {
             .iter_mut()
             .filter(|t| t.from == from)
             .map(|t| {
-                if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_TIMEOUT_MS {
-                    t.status = "timeout".to_string();
-                }
+                age(t, now);
                 t.clone()
             })
             .collect()
+    }
+
+    /// Validate and hand a task to a live session: the shared core of the
+    /// agent-facing `dispatch` MCP tool and the human-facing `human_dispatch`
+    /// Tauri command (lib.rs) — one ledger and one set of rules regardless of
+    /// who started the task. Conductor-only enforcement is deliberately NOT
+    /// here: that's an MCP-specific policy the `dispatch` tool applies before
+    /// calling this, and `human_dispatch` has no agent identity to check it
+    /// against — the human already decided who to promote.
+    ///
+    /// The task record is created in "pending" status BEFORE `submit_to` is
+    /// called. That closes the original race while still allowing an unusually
+    /// fast target to complete the task as soon as it receives the prompt.
+    pub fn dispatch_task(
+        &self,
+        from: &str,
+        target: &str,
+        task: &str,
+    ) -> Result<DispatchOutcome, String> {
+        let target_is_live = self.engine.ids().iter().any(|i| i == target);
+        dispatch_precheck(self.is_halted(), from, target, target_is_live)?;
+        if !self.take_dispatch_budget() {
+            return Err("dispatch budget exhausted for this run.".to_string());
+        }
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        self.add_task(Task {
+            id: id.clone(),
+            from: from.to_string(),
+            target: target.to_string(),
+            task: task.to_string(),
+            status: "pending".to_string(),
+            result: String::new(),
+            ts_ms: Self::now_ms(),
+        });
+
+        // Typed into the target's terminal, so the human sees every
+        // instruction. Submit Enter separately: Codex and Claude Code treat
+        // text+CR in one PTY write as a paste and can leave it waiting in the
+        // input editor — see `SessionManager::submit_to`.
+        let injection = dispatch_prompt(from, &id, task);
+        let delivered = self.engine.submit_to(target, &injection);
+        if !delivered {
+            self.mark_delivery_failed(&id);
+        }
+        Ok(DispatchOutcome {
+            task_id: id,
+            delivered,
+        })
+    }
+}
+
+/// Age a single task in place: still-pending past the timeout becomes
+/// "timeout". Shared by `task_status` (one id) and `tasks_from` (a whole
+/// list), which used to duplicate this check inline.
+fn age(t: &mut Task, now: u64) {
+    if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_TIMEOUT_MS {
+        t.status = "timeout".to_string();
+    }
+}
+
+/// The core of `finish_task`: flip a task from "pending" to "done", but only
+/// if it is still pending. Pure over a task list, with no lock or emit, so the
+/// state transition can be tested directly.
+fn finish_pending(tasks: &mut [Task], id: &str, result: &str) -> bool {
+    match tasks
+        .iter_mut()
+        .find(|t| t.id == id && t.status == "pending")
+    {
+        Some(t) => {
+            t.status = "done".to_string();
+            t.result = result.to_string();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Mark delivery failure only while the task is still pending. Completion or
+/// cancellation that wins the race remains authoritative.
+fn mark_pending_error(tasks: &mut [Task], id: &str) -> bool {
+    match tasks
+        .iter_mut()
+        .find(|t| t.id == id && t.status == "pending")
+    {
+        Some(t) => {
+            t.status = "error".to_string();
+            true
+        }
+        None => false,
     }
 }
 
@@ -382,7 +506,10 @@ fn render_task(t: &Task) -> String {
 
 fn append_line(path: &PathBuf, s: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(s.as_bytes())
 }
 
@@ -499,7 +626,9 @@ pub struct TaskQuery {
 
 #[tool_router]
 impl BrainHandler {
-    #[tool(description = "Declare who you are in this Mosaic workspace. Call once at startup before other tools.")]
+    #[tool(
+        description = "Declare who you are in this Mosaic workspace. Call once at startup before other tools."
+    )]
     fn set_session_identity(&self, Parameters(p): Parameters<Identify>) -> String {
         // On a dedicated endpoint Mosaic already knows who you are.
         if let Some(b) = &self.bound {
@@ -508,7 +637,10 @@ impl BrainHandler {
             }
             return format!("Already identified as '{b}' — Mosaic knows this session.");
         }
-        let session = AgentSession { name: p.name.clone(), kind: p.kind.clone() };
+        let session = AgentSession {
+            name: p.name.clone(),
+            kind: p.kind.clone(),
+        };
         *self.identity.lock().unwrap() = Some(session.clone());
         // Replace rather than append: an agent that identifies twice should not
         // show up twice in the session list.
@@ -521,10 +653,16 @@ impl BrainHandler {
             self.shared.set_room(&p.name, &p.room);
         }
         let _ = self.shared.app.emit("context-changed", ());
-        format!("Identity set to '{}' in brain '{}'", p.name, self.shared.room_for(&p.name))
+        format!(
+            "Identity set to '{}' in brain '{}'",
+            p.name,
+            self.shared.room_for(&p.name)
+        )
     }
 
-    #[tool(description = "Record a decision so every other agent instantly knows it. Use for choices that affect shared work.")]
+    #[tool(
+        description = "Record a decision so every other agent instantly knows it. Use for choices that affect shared work."
+    )]
     fn record_decision(&self, Parameters(p): Parameters<DecisionArgs>) -> String {
         let body = if p.rationale.is_empty() {
             p.decision
@@ -535,19 +673,25 @@ impl BrainHandler {
         "Decision recorded to the shared brain.".to_string()
     }
 
-    #[tool(description = "Record a durable fact other agents can rely on (e.g. an API shape, a path, a convention).")]
+    #[tool(
+        description = "Record a durable fact other agents can rely on (e.g. an API shape, a path, a convention)."
+    )]
     fn record_fact(&self, Parameters(p): Parameters<FactArgs>) -> String {
-        self.shared.add("fact", &self.author(), &p.category, &p.fact);
+        self.shared
+            .add("fact", &self.author(), &p.category, &p.fact);
         "Fact recorded to the shared brain.".to_string()
     }
 
     #[tool(description = "Broadcast a short message or blocker to all agents.")]
     fn broadcast(&self, Parameters(p): Parameters<BroadcastArgs>) -> String {
-        self.shared.add("broadcast", &self.author(), "broadcast", &p.message);
+        self.shared
+            .add("broadcast", &self.author(), "broadcast", &p.message);
         "Broadcast sent.".to_string()
     }
 
-    #[tool(description = "Read the shared context (recent decisions, facts, broadcasts) from all agents. Read this before re-deriving something.")]
+    #[tool(
+        description = "Read the shared context (recent decisions, facts, broadcasts) from all agents. Read this before re-deriving something."
+    )]
     fn get_shared_context(&self) -> String {
         let room = self.shared.room_for(&self.author());
         let entries = self.shared.entries_snapshot();
@@ -557,7 +701,10 @@ impl BrainHandler {
         }
         let mut out = format!("# Shared context — brain '{room}' (most recent first)\n");
         for e in mine.iter().rev().take(50) {
-            out.push_str(&format!("- [{}] ({}) {}: {}\n", e.kind, e.author, e.topic, e.body));
+            out.push_str(&format!(
+                "- [{}] ({}) {}: {}\n",
+                e.kind, e.author, e.topic, e.body
+            ));
         }
         out
     }
@@ -621,6 +768,8 @@ impl BrainHandler {
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
 
+        // Conductor-only is MCP-specific policy, so it's checked here rather
+        // than in `dispatch_task` — see that method's doc comment.
         if self.shared.is_halted() {
             return "Refused: dispatch is halted by the user (Stop). Do not retry.".to_string();
         }
@@ -629,44 +778,22 @@ impl BrainHandler {
             Some(_) => {
                 return "Refused: you are not the conductor of this workspace.".to_string();
             }
-            None => return "Refused: no conductor is set. Ask the user to promote a pane.".to_string(),
-        }
-        if p.target == me {
-            return "Refused: cannot dispatch to yourself.".to_string();
-        }
-        if !self.shared.engine.ids().iter().any(|i| i == &p.target) {
-            return format!(
-                "Refused: no live session '{}'. Call list_sessions for valid targets.",
-                p.target
-            );
-        }
-        if !self.shared.take_dispatch_budget() {
-            return "Refused: dispatch budget exhausted for this run.".to_string();
+            None => {
+                return "Refused: no conductor is set. Ask the user to promote a pane.".to_string()
+            }
         }
 
-        let uid = uuid::Uuid::new_v4().simple().to_string();
-        let id = uid[..6].to_string();
-        // Typed into the target's terminal, so the human sees every instruction.
-        // Submit Enter separately: Codex and Claude Code treat text+CR in one
-        // PTY write as a paste and can leave it waiting in the input editor.
-        let injection = dispatch_prompt(&me, &id, &p.task);
-        if !self.shared.engine.submit_to(&p.target, &injection) {
-            return "Refused: could not write to that session.".to_string();
+        match self.shared.dispatch_task(&me, &p.target, &p.task) {
+            Err(e) => format!("Refused: {e}"),
+            Ok(o) if o.delivered => format!(
+                "Dispatched to {} as task {}. Poll get_task_result with that id.",
+                p.target, o.task_id
+            ),
+            Ok(o) => format!(
+                "Task {} recorded for {} but delivery failed (could not write to that session) — status is 'error'.",
+                o.task_id, p.target
+            ),
         }
-
-        self.shared.add_task(Task {
-            id: id.clone(),
-            from: me,
-            target: p.target.clone(),
-            task: p.task.clone(),
-            status: "pending".to_string(),
-            result: String::new(),
-            ts_ms: Shared::now_ms(),
-        });
-        format!(
-            "Dispatched to {} as task {}. Poll get_task_result with that id.",
-            p.target, id
-        )
     }
 
     #[tool(description = "Report the result of a task the conductor dispatched to you.")]
@@ -700,7 +827,12 @@ impl BrainHandler {
             pending
         );
         for t in &mine {
-            out.push_str(&format!("\n## {} → {}\n{}\n", t.id, t.target, render_task(t)));
+            out.push_str(&format!(
+                "\n## {} → {}\n{}\n",
+                t.id,
+                t.target,
+                render_task(t)
+            ));
         }
         out
     }
@@ -708,7 +840,10 @@ impl BrainHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{conductor_briefing, dispatch_prompt, render_task, Task};
+    use super::{
+        age, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
+        mark_pending_error, render_task, Task, TASK_TIMEOUT_MS,
+    };
 
     #[test]
     fn dispatch_prompt_is_single_line_and_includes_completion_contract() {
@@ -784,6 +919,127 @@ mod tests {
         let rendered = render_task(&done);
         assert!(rendered.starts_with("[done]"));
         assert!(rendered.contains("found two bugs"));
+    }
+
+    #[test]
+    fn render_task_handles_the_error_status() {
+        let base = Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: "error".into(),
+            result: String::new(),
+            ts_ms: 0,
+        };
+        assert!(render_task(&base).starts_with("[error]"));
+    }
+
+    // dispatch_precheck: order matters because it decides which message wins
+    // when more than one check would refuse, and that order is what the live
+    // `dispatch` tool preserves by checking `is_halted` first, outside this
+    // function, before ever calling it.
+
+    #[test]
+    fn dispatch_precheck_refuses_when_halted() {
+        let err = dispatch_precheck(true, "sess-1", "sess-2", true).unwrap_err();
+        assert!(err.contains("halted"));
+    }
+
+    #[test]
+    fn dispatch_precheck_refuses_self_dispatch() {
+        let err = dispatch_precheck(false, "sess-1", "sess-1", true).unwrap_err();
+        assert!(err.contains("cannot dispatch to yourself"));
+    }
+
+    #[test]
+    fn dispatch_precheck_refuses_a_target_that_is_not_live() {
+        let err = dispatch_precheck(false, "sess-1", "sess-2", false).unwrap_err();
+        assert!(err.contains("no live session 'sess-2'"));
+    }
+
+    #[test]
+    fn dispatch_precheck_passes_a_valid_dispatch() {
+        assert!(dispatch_precheck(false, "sess-1", "sess-2", true).is_ok());
+    }
+
+    #[test]
+    fn finish_pending_completes_a_pending_task() {
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+        assert!(finish_pending(&mut tasks, "abc123", "found two bugs"));
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(tasks[0].result, "found two bugs");
+    }
+
+    #[test]
+    fn finish_pending_refuses_an_unknown_id() {
+        let mut tasks: Vec<Task> = vec![];
+        assert!(!finish_pending(&mut tasks, "nope", "result"));
+    }
+
+    #[test]
+    fn mark_pending_error_records_a_delivery_failure() {
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "t".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+        assert!(mark_pending_error(&mut tasks, "abc123"));
+        assert_eq!(tasks[0].status, "error");
+    }
+
+    #[test]
+    fn mark_pending_error_does_not_overwrite_a_cancelled_task() {
+        // Simulates set_halted landing between add_task and delivery failure:
+        // by the time delivery resolves the task is already "cancelled", and
+        // that must win over the delivery outcome.
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "t".into(),
+            status: "cancelled".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+        assert!(!mark_pending_error(&mut tasks, "abc123"));
+        assert_eq!(tasks[0].status, "cancelled");
+    }
+
+    #[test]
+    fn age_times_out_a_stale_pending_task_but_leaves_other_statuses_alone() {
+        let base = Task {
+            id: "a".into(),
+            from: "f".into(),
+            target: "t".into(),
+            task: "x".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        };
+
+        let mut pending = base.clone();
+        age(&mut pending, TASK_TIMEOUT_MS + 1);
+        assert_eq!(pending.status, "timeout");
+
+        let mut errored = Task {
+            status: "error".into(),
+            ..base
+        };
+        age(&mut errored, TASK_TIMEOUT_MS + 1);
+        assert_eq!(errored.status, "error");
     }
 }
 
