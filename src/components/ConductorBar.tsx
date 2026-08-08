@@ -1,41 +1,32 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { conductorState, haltConductor, type ConductorTask } from "../lib/ipc";
+import { useMemo } from "react";
+import { type ConductorTask } from "../lib/ipc";
+
+type ConductorBarProps = {
+  conductor: string;
+  tasks: ConductorTask[];
+  halted: boolean;
+  onDemote: () => void;
+  onHaltChange: (halted: boolean) => void;
+  onOpenDispatch: () => void;
+  panes: { id: string; type: import("../lib/ipc").SessionType; status: string }[];
+};
 
 // Live view of what the conductor is doing, plus the global kill-switch.
 // Every dispatch also lands visibly in its target's terminal — this bar is the
 // at-a-glance version.
 export function ConductorBar({
   conductor,
+  tasks,
+  halted,
   onDemote,
-}: {
-  conductor: string;
-  onDemote: () => void;
-}) {
-  const [tasks, setTasks] = useState<ConductorTask[]>([]);
-  const [halted, setHalted] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    const refresh = async () => {
-      try {
-        const s = await conductorState();
-        if (!alive) return;
-        setTasks(s.tasks);
-        setHalted(s.halted);
-      } catch {
-        /* backend not ready */
-      }
-    };
-    refresh();
-    const unlisten = listen("conductor-changed", refresh);
-    const poll = setInterval(refresh, 3000); // catch agent-side completions
-    return () => {
-      alive = false;
-      clearInterval(poll);
-      unlisten.then((f) => f());
-    };
-  }, []);
+  onHaltChange,
+  onOpenDispatch,
+  panes,
+}: ConductorBarProps) {
+  const availableTargets = useMemo(
+    () => panes.filter((p) => p.status === "running" && p.id !== conductor && p.type.id !== "shell"),
+    [panes, conductor]
+  );
 
   const pending = tasks.filter((t) => t.status === "pending").length;
 
@@ -71,12 +62,17 @@ export function ConductorBar({
       </div>
 
       <div className="spacer" />
+      {availableTargets.length > 0 && (
+        <button className="ghost" onClick={onOpenDispatch} title="Dispatch a task to an agent">
+          Dispatch…
+        </button>
+      )}
       <button className="ghost" onClick={onDemote} title="Stop being the conductor">
         Demote
       </button>
       <button
         className={"stop" + (halted ? " on" : "")}
-        onClick={() => haltConductor(!halted)}
+        onClick={() => onHaltChange(!halted)}
         title={halted ? "Resume dispatching" : "Halt all dispatch immediately"}
       >
         <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">

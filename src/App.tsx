@@ -6,6 +6,8 @@ import { SessionLauncher } from "./components/SessionLauncher";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ContextSidebar } from "./components/ContextSidebar";
 import { ConductorBar } from "./components/ConductorBar";
+import { DispatchDialog } from "./components/DispatchDialog";
+import { ToastContainer } from "./components/Toast";
 import {
   LayoutPanel,
   type LayoutColumns,
@@ -16,7 +18,9 @@ import {
   setAgentBrain,
   conductorState,
   setConductor,
+  haltConductor,
   setProject as setProjectDir,
+  dispatchTask,
   type SessionType,
 } from "./lib/ipc";
 import { brainColorMap } from "./lib/brains";
@@ -74,6 +78,10 @@ function App() {
   });
   // Which pane (if any) is the conductor. Owned by the app, never self-claimed.
   const [conductor, setConductorName] = useState<string | null>(null);
+  const [conductorTasks, setConductorTasks] = useState<import("./lib/ipc").ConductorTask[]>([]);
+  const [conductorHalted, setConductorHalted] = useState(false);
+  const [dispatchOpen, setDispatchOpen] = useState(false);
+  const [toasts, setToasts] = useState<string[]>([]); // dismissed task ids
   const counter = useRef(0);
   const dragId = useRef<string | null>(null);
 
@@ -82,15 +90,21 @@ function App() {
     const refresh = async () => {
       try {
         const s = await conductorState();
-        if (alive) setConductorName(s.conductor);
+        if (alive) {
+          setConductorName(s.conductor);
+          setConductorTasks(s.tasks);
+          setConductorHalted(s.halted);
+        }
       } catch {
         /* backend not ready */
       }
     };
     refresh();
     const unlisten = listen("conductor-changed", refresh);
+    const poll = setInterval(refresh, 3000);
     return () => {
       alive = false;
+      clearInterval(poll);
       unlisten.then((f) => f());
     };
   }, []);
@@ -172,6 +186,15 @@ function App() {
     let n = 2;
     while (brainList.includes(`brain-${n}`)) n++;
     return `brain-${n}`;
+  }
+
+  // ---- Dispatch ----
+  async function handleDispatch(target: string, task: string) {
+    await dispatchTask(target, task);
+  }
+
+  function dismissToast(taskId: string) {
+    setToasts((t) => [...t, taskId]);
   }
 
   // ---- drag wiring ----
@@ -304,7 +327,15 @@ function App() {
       </header>
 
       {conductor && (
-        <ConductorBar conductor={conductor} onDemote={() => toggleConductor(conductor)} />
+        <ConductorBar
+          conductor={conductor}
+          tasks={conductorTasks}
+          halted={conductorHalted}
+          onDemote={() => toggleConductor(conductor)}
+          onHaltChange={haltConductor}
+          onOpenDispatch={() => setDispatchOpen(true)}
+          panes={panes}
+        />
       )}
 
       <div className="body">
@@ -451,6 +482,18 @@ function App() {
           onClose={() => setLayoutOpen(false)}
         />
       )}
+      {dispatchOpen && (
+        <DispatchDialog
+          panes={panes}
+          conductorId={conductor}
+          onClose={() => setDispatchOpen(false)}
+          onDispatch={handleDispatch}
+        />
+      )}
+      <ToastContainer
+        tasks={conductorTasks.filter((t) => !toasts.includes(t.id))}
+        onDismiss={dismissToast}
+      />
     </div>
   );
 }
