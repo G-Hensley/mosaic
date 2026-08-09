@@ -81,15 +81,74 @@ const SUBMIT_QUIET_MS: u64 = 200;
 /// we finish writing, which tells us nothing at all — this floor is what covers
 /// that case. It is also the delay the previous implementation used, so short
 /// prompts wait exactly as long as they did before and cannot regress.
+///
+/// This is the floor for a *small* payload; see `submit_floor_ms`, which raises
+/// it in proportion to how much there is to deliver.
 const SUBMIT_FLOOR_MS: u64 = 300;
 
 /// Give up waiting for quiet and send Enter regardless. An agent that is already
 /// mid-task streams output continuously and would never look quiet, so without a
 /// ceiling its dispatch would wait forever. This bounds the wait instead.
+///
+/// Like the floor, this is the allowance for a small payload; `submit_ceiling_ms`
+/// extends it by the same delivery estimate so a big paste is not cut off by a
+/// bound that was only ever sized for a small one.
 const SUBMIT_CEILING_MS: u64 = 4000;
+
+/// Assumed worst-case rate at which a payload reaches the target, in bytes per
+/// millisecond, used to size both bounds against the actual payload.
+///
+/// This is deliberately far below raw pipe throughput, because the quantity that
+/// matters is not how fast ConPTY moves bytes but how fast the target *consumes*
+/// them — a TUI that re-renders its composer on every chunk ingests far slower
+/// than the pipe delivers. The value is anchored to the live repro: a 1946-byte
+/// dispatch was still arriving after 300 ms, so the effective rate is below
+/// 1946/300 ≈ 6.5 B/ms. Rounding down to 4 B/ms gives that payload a 486 ms
+/// delivery allowance — comfortably past the point it was observed to fail —
+/// and keeps the estimate conservative for slower machines.
+const SUBMIT_BYTES_PER_MS: u64 = 4;
+
+/// Ceiling on the payload-derived delivery allowance. Without it a pathologically
+/// large prompt would scale its own timeout without limit; with it the total wait
+/// can never exceed `SUBMIT_CEILING_MS + SUBMIT_DELIVERY_CAP_MS`.
+const SUBMIT_DELIVERY_CAP_MS: u64 = 10_000;
 
 /// How often to re-check for quiet while waiting.
 const SUBMIT_POLL_MS: u64 = 20;
+
+/// How long `payload_len` bytes could plausibly still be in flight to the target.
+///
+/// Both bounds are built from this, which is what ties the timing policy to the
+/// thing that actually varies. The previous constants were fixed, so a 50-byte
+/// prompt and a 50 KB one were given identical windows.
+fn delivery_allowance_ms(payload_len: usize) -> u64 {
+    ((payload_len as u64) / SUBMIT_BYTES_PER_MS).min(SUBMIT_DELIVERY_CAP_MS)
+}
+
+/// Earliest an Enter may be sent for a payload of `payload_len` bytes.
+///
+/// Raising the floor with payload size is what closes the noisy-pane hole. The
+/// "has the target reacted" rule infers reaction from the output clock moving,
+/// but a pane that was *already* streaming when the dispatch arrived satisfies
+/// that instantly with output that has nothing to do with our paste; a lull in
+/// that unrelated stream then reads as "done receiving". Holding until the
+/// payload could plausibly have been delivered means such a lull can no longer
+/// release an Enter into a paste that is still arriving.
+fn submit_floor_ms(payload_len: usize) -> u64 {
+    SUBMIT_FLOOR_MS.max(delivery_allowance_ms(payload_len))
+}
+
+/// Latest an Enter may be withheld for a payload of `payload_len` bytes.
+///
+/// Extending the ceiling by the same delivery estimate keeps the backstop from
+/// expiring *during* delivery of a large paste, which would fire Enter into the
+/// middle of it — the exact failure the ceiling is supposed to be a safe fallback
+/// from. Adding the allowance to a base that already exceeds `SUBMIT_FLOOR_MS`
+/// also keeps this strictly above `submit_floor_ms` for every input, so the
+/// backstop can never preempt the floor.
+fn submit_ceiling_ms(payload_len: usize) -> u64 {
+    SUBMIT_CEILING_MS + delivery_allowance_ms(payload_len)
+}
 
 /// Bracketed paste markers (DECSET 2004). Wrapping a payload in these makes it
 /// one explicit paste event with a defined end, instead of something the target
@@ -126,13 +185,24 @@ fn is_codex(program: &str) -> bool {
 /// Silence before the target has produced anything therefore counts as still
 /// receiving. Only once it has actually said something does going quiet mean it
 /// is done, and the ceiling still bounds the wait if it never speaks at all.
-fn ready_to_submit(now: u64, started: u64, last_output: u64, baseline: u64) -> bool {
+///
+/// `payload_len` is the size of what was written, in bytes, and scales both
+/// bounds — see `submit_floor_ms` and `submit_ceiling_ms`. Reacting to output
+/// alone is not sufficient when the target was already talking before we wrote,
+/// so the floor carries the part of the decision that output cannot.
+fn ready_to_submit(
+    now: u64,
+    started: u64,
+    last_output: u64,
+    baseline: u64,
+    payload_len: usize,
+) -> bool {
     let waited = now.saturating_sub(started);
     // Checked first so a silent target is always released eventually.
-    if waited >= SUBMIT_CEILING_MS {
+    if waited >= submit_ceiling_ms(payload_len) {
         return true;
     }
-    if waited < SUBMIT_FLOOR_MS {
+    if waited < submit_floor_ms(payload_len) {
         return false;
     }
     if last_output == baseline {
@@ -285,6 +355,10 @@ impl SessionManager {
         } else {
             Cow::Borrowed(prompt)
         };
+        // Measured on the framed payload, not the bare prompt: the markers are
+        // bytes the target has to ingest too, and it is the full write that has
+        // to have landed before an Enter can mean "submit".
+        let payload_len = payload.len();
         if !self.write_to(id, &payload) {
             return false;
         }
@@ -293,7 +367,13 @@ impl SessionManager {
         let id = id.to_string();
         thread::spawn(move || {
             let started = mono_ms();
-            while !ready_to_submit(mono_ms(), started, clock.load(Ordering::Relaxed), baseline) {
+            while !ready_to_submit(
+                mono_ms(),
+                started,
+                clock.load(Ordering::Relaxed),
+                baseline,
+                payload_len,
+            ) {
                 thread::sleep(Duration::from_millis(SUBMIT_POLL_MS));
             }
             engine.write_to(&id, "\r");
@@ -856,8 +936,9 @@ fn human_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_agent_cli, is_codex, ready_to_submit, validate_human_dispatch, worktree, SpawnRollback,
-        SUBMIT_CEILING_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        delivery_allowance_ms, is_agent_cli, is_codex, ready_to_submit, submit_ceiling_ms,
+        submit_floor_ms, validate_human_dispatch, worktree, SpawnRollback, SUBMIT_BYTES_PER_MS,
+        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -939,9 +1020,18 @@ mod tests {
     // used here so the cases stay arithmetically honest.
     const BASE: u64 = 100;
 
+    // A payload small enough to add no delivery allowance, so the cases below
+    // exercise the quiet/reacted rules against the unscaled base bounds. Size
+    // scaling is covered separately further down.
+    const SMALL: usize = 0;
+
+    // The payload from the live repro: a ~1900-character dispatch that sat in
+    // Codex's composer as "[Pasted Content 1946 chars]", unsubmitted.
+    const REPRO: usize = 1946;
+
     #[test]
     fn holds_below_the_floor() {
-        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, BASE + 1, BASE));
+        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, BASE + 1, BASE, SMALL));
     }
 
     // The regression that shipped: a target which stays silent while it buffers a
@@ -957,7 +1047,7 @@ mod tests {
         // Stale by design: the target has produced nothing since before the write,
         // so an elapsed-quiet check alone would read this as "finished" and fire.
         assert!(now - BASE >= SUBMIT_QUIET_MS);
-        assert!(!ready_to_submit(now, 0, BASE, BASE));
+        assert!(!ready_to_submit(now, 0, BASE, BASE, SMALL));
     }
 
     #[test]
@@ -965,27 +1055,122 @@ mod tests {
         let now = SUBMIT_FLOOR_MS + SUBMIT_QUIET_MS;
         let last_output = now - SUBMIT_QUIET_MS;
         assert!(last_output != BASE);
-        assert!(ready_to_submit(now, 0, last_output, BASE));
+        assert!(ready_to_submit(now, 0, last_output, BASE, SMALL));
     }
 
     #[test]
     fn holds_while_the_target_is_still_producing_output() {
         let now = SUBMIT_FLOOR_MS + 500;
-        assert!(!ready_to_submit(now, 0, now - 10, BASE));
+        assert!(!ready_to_submit(now, 0, now - 10, BASE, SMALL));
     }
 
     #[test]
     fn submits_at_the_ceiling_even_if_the_target_never_speaks() {
         // Backstop for a CLI that echoes nothing at all: without this the
         // has-it-reacted rule would hold the Enter forever.
-        assert!(ready_to_submit(SUBMIT_CEILING_MS, 0, BASE, BASE));
+        assert!(ready_to_submit(SUBMIT_CEILING_MS, 0, BASE, BASE, SMALL));
     }
 
     #[test]
     fn quiet_is_measured_from_the_last_output_not_from_the_write() {
         let now = SUBMIT_FLOOR_MS + 1_000;
-        assert!(ready_to_submit(now, 0, now - SUBMIT_QUIET_MS, BASE));
-        assert!(!ready_to_submit(now, 0, now - (SUBMIT_QUIET_MS - 1), BASE));
+        assert!(ready_to_submit(now, 0, now - SUBMIT_QUIET_MS, BASE, SMALL));
+        assert!(!ready_to_submit(
+            now,
+            0,
+            now - (SUBMIT_QUIET_MS - 1),
+            BASE,
+            SMALL
+        ));
+    }
+
+    // Size scaling. Both bounds were fixed constants, so a 50-byte prompt and a
+    // 50 KB one were given identical windows — the payload is the one input that
+    // actually varies between dispatches.
+
+    #[test]
+    fn a_small_payload_keeps_the_original_bounds() {
+        // Nothing that fit comfortably before may start waiting longer now.
+        assert_eq!(submit_floor_ms(SMALL), SUBMIT_FLOOR_MS);
+        assert_eq!(submit_ceiling_ms(SMALL), SUBMIT_CEILING_MS);
+        // Anything under the floor's worth of bytes is still governed by the floor.
+        let below = (SUBMIT_FLOOR_MS * SUBMIT_BYTES_PER_MS) as usize;
+        assert_eq!(submit_floor_ms(below), SUBMIT_FLOOR_MS);
+    }
+
+    #[test]
+    fn the_repro_payload_is_held_past_the_delay_it_was_seen_to_lose_enter_at() {
+        // The dispatch that failed live was still arriving after 300 ms, so a
+        // payload that size must not be released at 300 ms.
+        let floor = submit_floor_ms(REPRO);
+        assert!(
+            floor > SUBMIT_FLOOR_MS,
+            "a {REPRO}-byte payload must outwait the small-payload floor, got {floor}"
+        );
+        assert!(!ready_to_submit(SUBMIT_FLOOR_MS, 0, BASE + 1, BASE, REPRO));
+    }
+
+    // The hole that survived the quiet-detection fix. A pane that was already
+    // streaming when the dispatch arrived moves its output clock off `baseline`
+    // immediately, with output that has nothing to do with our paste — so the
+    // has-it-reacted rule is satisfied by noise. A lull in that unrelated stream
+    // then looks exactly like "finished receiving", and before the floor scaled
+    // with size it would have fired an Enter into a paste still in delivery.
+    #[test]
+    fn a_lull_in_an_already_noisy_pane_cannot_release_a_large_paste_early() {
+        // Sampled between the two floors, where the old fixed bound would have
+        // released and the scaled one still holds. Derived rather than hardcoded
+        // so retuning the rate cannot quietly empty this window.
+        let now = SUBMIT_FLOOR_MS + (submit_floor_ms(REPRO) - SUBMIT_FLOOR_MS) / 2;
+        assert!(now >= SUBMIT_FLOOR_MS && now < submit_floor_ms(REPRO));
+        let last_output = now - SUBMIT_QUIET_MS;
+        // The two rules that are supposed to protect us both read as satisfied:
+        // the target has "reacted", and it has been quiet long enough.
+        assert!(last_output != BASE);
+        assert!(now - last_output >= SUBMIT_QUIET_MS);
+        // Same instant, same clocks: a small payload goes, a large one is held.
+        assert!(ready_to_submit(now, 0, last_output, BASE, SMALL));
+        assert!(!ready_to_submit(now, 0, last_output, BASE, REPRO));
+        // And it does go once the payload could actually have been delivered.
+        let after = submit_floor_ms(REPRO) + SUBMIT_QUIET_MS;
+        assert!(ready_to_submit(
+            after,
+            0,
+            after - SUBMIT_QUIET_MS,
+            BASE,
+            REPRO
+        ));
+    }
+
+    #[test]
+    fn the_ceiling_never_expires_while_a_large_payload_is_still_arriving() {
+        // The backstop is a fallback from the bug, so it must not reproduce it by
+        // firing mid-delivery. It has to outlast the floor for every payload.
+        for len in [SMALL, 1, REPRO, 64 * 1024, 8 * 1024 * 1024] {
+            assert!(
+                submit_ceiling_ms(len) > submit_floor_ms(len),
+                "ceiling must outlast the floor at {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wait_stays_bounded_however_large_the_payload() {
+        // Scaling must not become an unbounded timeout: a pathological prompt
+        // still has to release Enter, and dispatch must not hang on it.
+        let huge = usize::MAX;
+        assert_eq!(delivery_allowance_ms(huge), SUBMIT_DELIVERY_CAP_MS);
+        assert_eq!(
+            submit_ceiling_ms(huge),
+            SUBMIT_CEILING_MS + SUBMIT_DELIVERY_CAP_MS
+        );
+        assert!(ready_to_submit(
+            SUBMIT_CEILING_MS + SUBMIT_DELIVERY_CAP_MS,
+            0,
+            BASE,
+            BASE,
+            huge
+        ));
     }
 
     #[test]
