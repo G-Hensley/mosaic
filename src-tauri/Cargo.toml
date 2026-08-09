@@ -26,7 +26,7 @@ serde_json = "1"
 portable-pty = "0.9"
 # Only the sync mpsc — Tauri's runtime drives the futures, so we skip tokio's runtime.
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync"] }
-rmcp = { version = "2.2.0", features = ["schemars", "server", "transport-streamable-http-server"] }
+rmcp = { version = "3.1.1", features = ["schemars", "server", "transport-streamable-http-server"] }
 axum = "0.8.9"
 uuid = { version = "1.24.0", features = ["v4"] }
 schemars = "1"
