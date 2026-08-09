@@ -1,7 +1,7 @@
 /* Fallback tokens (Tokyo Night). The AppearanceProvider overrides these on the
    document root via setProperty, so themes swap by rewriting these variables. */
 :root {
-  --bg: #16161e;
+  --bg: var(--bg);
   --bar: #1a1b26;
   --panel: #1a1b26;
   --panel2: #1c1d2b;
@@ -9,7 +9,7 @@
   --txt: #c0caf5;
   --dim: #565f89;
   --acc: #7aa2f7;
-  --acc-ink: #16161e;
+  --acc-ink: var(--acc-ink);
   --danger: #f7768e;
   --sel: rgba(122, 162, 247, 0.14);
 }
@@ -1209,6 +1209,16 @@ button.ghost.on {
   .spinner {
     animation: none;
   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .spinner { animation: none; }
+  .toast { animation: none !important; }
 }
 
 /* ---- Toast Notifications ---- */

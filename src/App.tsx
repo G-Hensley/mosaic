@@ -417,17 +417,18 @@ function App() {
                     )}
                     {p.status === "exited" && <span className="pane-ended">ended</span>}
                     <div className="spacer" />
-                    <button
-                      className={"pane-cond" + (conductor === p.id ? " on" : "")}
-                      title={
-                        conductor === p.id
-                          ? "Conductor — click to demote"
-                          : "Make this pane the conductor"
-                      }
-                      onClick={() => toggleConductor(p.id)}
-                    >
-                      ⌁
-                    </button>
+<button
+          className={"pane-cond" + (conductor === p.id ? " on" : "")}
+          title={
+            conductor === p.id
+              ? "Conductor — click to demote"
+              : "Make this pane the conductor"
+          }
+          aria-label={conductor === p.id ? "Demote conductor" : "Make conductor"}
+          onClick={() => toggleConductor(p.id)}
+        >
+          ⌁
+        </button>
                     <button
                       className={"pane-focus" + (focusedPane === p.id ? " on" : "")}
                       title={focusedPane === p.id ? "Show all panes" : "Maximize this pane"}
@@ -436,9 +437,9 @@ function App() {
                     >
                       {focusedPane === p.id ? "Restore" : "Maximize"}
                     </button>
-                    <button className="pane-x" title="Close session" onClick={() => closePane(p.id)}>
-                      ✕
-                    </button>
+<button className="pane-x" title="Close session" aria-label="Close session" onClick={() => closePane(p.id)}>
+          ✕
+        </button>
                   </div>
                   <TerminalPane
                     sessionId={p.id}

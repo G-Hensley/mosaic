@@ -6,17 +6,19 @@ export const TERM_FONT =
   "'JetBrains Mono', 'Cascadia Code', Menlo, Consolas, monospace";
 
 export type Tokens = {
-  bg: string; // app background
-  bar: string; // title bar background
-  panel: string; // pane background
-  panel2: string; // pane header / launcher / settings surface
-  edge: string; // borders
-  txt: string; // primary text
-  dim: string; // muted text
-  acc: string; // accent / primary button
-  accInk: string; // text on accent
-  danger: string; // destructive (close, errors)
-  sel: string; // hover / selection tint (rgba)
+  bg: string;
+  bar: string;
+  panel: string;
+  panel2: string;
+  edge: string;
+  txt: string;
+  dim: string;
+  acc: string;
+  accInk: string;
+  danger: string;
+  sel: string;
+  ok: string;
+  overlay: string;
 };
 
 export type XtermTheme = {
@@ -60,6 +62,7 @@ export const THEMES: Theme[] = [
       bg: "#16161e", bar: "#1a1b26", panel: "#1a1b26", panel2: "#1c1d2b",
       edge: "#2a2e42", txt: "#c0caf5", dim: "#565f89", acc: "#7aa2f7",
       accInk: "#16161e", danger: "#f7768e", sel: "rgba(122,162,247,0.14)",
+      ok: "#9ece6a", overlay: "rgba(10,10,16,0.55)",
     },
     xterm: {
       background: "#1a1b26", foreground: "#c0caf5", cursor: "#c0caf5",
@@ -79,6 +82,7 @@ export const THEMES: Theme[] = [
       bg: "#262335", bar: "#241b2f", panel: "#241b2f", panel2: "#2a2139",
       edge: "#3b2f4a", txt: "#ffffff", dim: "#a290c0", acc: "#ff7edb",
       accInk: "#241b2f", danger: "#fe4450", sel: "rgba(255,126,219,0.16)",
+      ok: "#72f1b8", overlay: "rgba(10,10,16,0.55)",
     },
     xterm: {
       background: "#262335", foreground: "#ffffff", cursor: "#f97e72",
@@ -97,6 +101,7 @@ export const THEMES: Theme[] = [
       bg: "#2e3440", bar: "#2b303b", panel: "#2e3440", panel2: "#343b4a",
       edge: "#3b4252", txt: "#d8dee9", dim: "#7b869c", acc: "#88c0d0",
       accInk: "#2e3440", danger: "#bf616a", sel: "rgba(136,192,208,0.16)",
+      ok: "#a3be8c", overlay: "rgba(10,10,16,0.55)",
     },
     xterm: {
       background: "#2e3440", foreground: "#d8dee9", cursor: "#d8dee9",
@@ -115,6 +120,7 @@ export const THEMES: Theme[] = [
       bg: "#2d353b", bar: "#2b3339", panel: "#2d353b", panel2: "#343f44",
       edge: "#3d484d", txt: "#d3c6aa", dim: "#859289", acc: "#a7c080",
       accInk: "#2d353b", danger: "#e67e80", sel: "rgba(167,192,128,0.16)",
+      ok: "#a7c080", overlay: "rgba(10,10,16,0.55)",
     },
     xterm: {
       background: "#2d353b", foreground: "#d3c6aa", cursor: "#d3c6aa",
@@ -133,6 +139,7 @@ export const THEMES: Theme[] = [
       bg: "#191724", bar: "#1f1d2e", panel: "#1f1d2e", panel2: "#26233a",
       edge: "#2a2739", txt: "#e0def4", dim: "#6e6a86", acc: "#ebbcba",
       accInk: "#191724", danger: "#eb6f92", sel: "rgba(235,188,186,0.14)",
+      ok: "#31748f", overlay: "rgba(10,10,16,0.55)",
     },
     xterm: {
       background: "#191724", foreground: "#e0def4", cursor: "#e0def4",
@@ -152,6 +159,7 @@ export const THEMES: Theme[] = [
       bg: "#f5f3ee", bar: "#efeae0", panel: "#ffffff", panel2: "#f0ece3",
       edge: "#dcd6ca", txt: "#33312c", dim: "#8a8577", acc: "#3b7dd8",
       accInk: "#ffffff", danger: "#c0392b", sel: "rgba(59,125,216,0.12)",
+      ok: "#3a7d3a", overlay: "rgba(30,30,30,0.45)",
     },
     xterm: {
       background: "#ffffff", foreground: "#33312c", cursor: "#33312c",

@@ -33,7 +33,7 @@ export function LayoutPanel({
       <div className="settings layout-settings" onClick={(e) => e.stopPropagation()}>
         <div className="settings-head">
           <span className="settings-title">Terminal layout</span>
-          <button className="settings-x" onClick={onClose} title="Close">
+          <button className="settings-x" onClick={onClose} title="Close" aria-label="Close">
             ✕
           </button>
         </div>

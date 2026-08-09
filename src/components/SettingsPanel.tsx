@@ -20,7 +20,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
       <div className="settings" onClick={(e) => e.stopPropagation()}>
         <div className="settings-head">
           <span className="settings-title">Appearance</span>
-          <button className="settings-x" onClick={onClose} title="Close">
+          <button className="settings-x" onClick={onClose} title="Close" aria-label="Close">
             ✕
           </button>
         </div>
