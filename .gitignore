@@ -28,6 +28,14 @@ src-tauri/target-ui-v2/
 # Per-machine tool settings
 .claude/settings.local.json
 
+# Internal improvement audit. Deliberately untracked: it is an itemized list of
+# known-unfixed weaknesses in this app (isolation that fails open, guessable task
+# IDs, full environment inheritance into spawned processes, no real auth on the
+# MCP ports). Publishing it in a public repo hands that list to anyone running a
+# version that predates the fixes. Keep it local until the findings are closed;
+# track only a sanitized roadmap.
+IMPROVEMENT-AUDIT.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
