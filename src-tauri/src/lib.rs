@@ -1031,7 +1031,13 @@ mod tests {
 
     #[test]
     fn holds_below_the_floor() {
-        assert!(!ready_to_submit(SUBMIT_FLOOR_MS - 1, 0, BASE + 1, BASE, SMALL));
+        assert!(!ready_to_submit(
+            SUBMIT_FLOOR_MS - 1,
+            0,
+            BASE + 1,
+            BASE,
+            SMALL
+        ));
     }
 
     // The regression that shipped: a target which stays silent while it buffers a
