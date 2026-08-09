@@ -84,6 +84,7 @@ export function ContextSidebar({
               onDropBrain(b, e.dataTransfer.getData("text/plain"));
             }}
             title="Click to view · drop a pane here to connect it"
+            aria-label={`Select brain ${b}`}
           >
             <span className="pill-dot" />
             {b}
@@ -98,6 +99,7 @@ export function ContextSidebar({
           }}
           onClick={() => onDropNewBrain()}
           title="Drop a pane here for a new brain"
+          aria-label="Create a new brain"
         >
           + new
         </button>

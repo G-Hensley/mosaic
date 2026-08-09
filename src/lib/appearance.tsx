@@ -48,6 +48,8 @@ export function applyAppearance(a: Appearance) {
   root.style.setProperty("--acc-ink", t.accInk);
   root.style.setProperty("--danger", t.danger);
   root.style.setProperty("--sel", t.sel);
+  root.style.setProperty("--ok", t.ok);
+  root.style.setProperty("--overlay", t.overlay);
   root.dataset.scheme = theme.id;
   root.dataset.glow = String(a.glow);
   root.dataset.light = String(!!theme.light);
