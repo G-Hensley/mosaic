@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,7 +75,7 @@ Each is a live agent idling until you give it work. Use the mosaic dispatch tool
     )
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Entry {
     pub kind: String, // "decision" | "fact" | "broadcast"
     pub author: String,
@@ -85,14 +85,14 @@ pub struct Entry {
     pub room: String, // which brain this belongs to
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct AgentSession {
     pub name: String,
     pub kind: String,
 }
 
 /// One dispatched unit of work, from the conductor to another session.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Task {
     pub id: String,
     pub from: String,
@@ -102,6 +102,60 @@ pub struct Task {
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
+}
+
+const STORE_FILE: &str = "brain.jsonl";
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum StoreRecord {
+    Entry(Entry),
+    Session(AgentSession),
+    Task(Task),
+}
+
+#[derive(Default)]
+struct StoredBrain {
+    entries: Vec<Entry>,
+    sessions: Vec<AgentSession>,
+    tasks: Vec<Task>,
+}
+
+fn load_brain(dir: &Path) -> StoredBrain {
+    let Ok(contents) = fs::read_to_string(dir.join(STORE_FILE)) else {
+        return StoredBrain::default();
+    };
+    let mut brain = StoredBrain::default();
+    for record in contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<StoreRecord>(line).ok())
+    {
+        match record {
+            StoreRecord::Entry(entry) => brain.entries.push(entry),
+            StoreRecord::Session(session) => {
+                if let Some(existing) = brain.sessions.iter_mut().find(|s| s.name == session.name) {
+                    *existing = session;
+                } else {
+                    brain.sessions.push(session);
+                }
+            }
+            StoreRecord::Task(task) => {
+                if let Some(existing) = brain.tasks.iter_mut().find(|t| t.id == task.id) {
+                    *existing = task;
+                } else {
+                    brain.tasks.push(task);
+                }
+            }
+        }
+    }
+    brain
+}
+
+fn append_record(dir: &Path, record: &StoreRecord) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+    line.push('\n');
+    append_line(&dir.join(STORE_FILE), &line)
 }
 
 /// Guardrails. Note that depth is bounded structurally: only the conductor may
@@ -176,9 +230,15 @@ impl Shared {
             .unwrap_or(0)
     }
 
-    /// Re-point the markdown mirror (the user picked a different project).
+    /// Re-point storage (the user picked a different project) and rehydrate it.
     pub fn set_dir(&self, dir: PathBuf) {
+        let brain = load_brain(&dir);
         *self.dir.lock().unwrap() = dir;
+        *self.entries.lock().unwrap() = brain.entries;
+        *self.sessions.lock().unwrap() = brain.sessions;
+        *self.tasks.lock().unwrap() = brain.tasks;
+        let _ = self.app.emit("context-changed", ());
+        let _ = self.app.emit("conductor-changed", ());
     }
 
     /// The brain a given agent name is currently in. Defaults to "main".
@@ -217,6 +277,7 @@ impl Shared {
         let _ = fs::create_dir_all(&dir);
         let file = dir.join(format!("{room}-{kind}s.md"));
         let _ = append_line(&file, &format!("- **{topic}** ({author}): {body}\n"));
+        let _ = append_record(&dir, &StoreRecord::Entry(entry.clone()));
         self.entries.lock().unwrap().push(entry);
         let _ = self.app.emit("context-changed", ());
     }
@@ -234,10 +295,13 @@ impl Shared {
     pub fn note_session(&self, name: &str, kind: &str) {
         let mut s = self.sessions.lock().unwrap();
         if !s.iter().any(|a| a.name == name) {
-            s.push(AgentSession {
+            let session = AgentSession {
                 name: name.to_string(),
                 kind: kind.to_string(),
-            });
+            };
+            let dir = self.dir.lock().unwrap().clone();
+            let _ = append_record(&dir, &StoreRecord::Session(session.clone()));
+            s.push(session);
         }
         drop(s);
         let _ = self.app.emit("context-changed", ());
@@ -326,10 +390,16 @@ impl Shared {
     pub fn set_halted(&self, v: bool) {
         *self.halted.lock().unwrap() = v;
         if v {
+            let mut changed = Vec::new();
             for t in self.tasks.lock().unwrap().iter_mut() {
                 if t.status == "pending" {
                     t.status = "cancelled".to_string();
+                    changed.push(t.clone());
                 }
+            }
+            let dir = self.dir.lock().unwrap().clone();
+            for task in changed {
+                let _ = append_record(&dir, &StoreRecord::Task(task));
             }
         } else {
             *self.dispatches.lock().unwrap() = 0;
@@ -356,6 +426,8 @@ impl Shared {
     }
 
     fn add_task(&self, t: Task) {
+        let dir = self.dir.lock().unwrap().clone();
+        let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
         self.tasks.lock().unwrap().push(t);
         let _ = self.app.emit("conductor-changed", ());
     }
@@ -363,6 +435,17 @@ impl Shared {
     fn finish_task(&self, id: &str, result: &str) -> bool {
         let found = finish_pending(&mut self.tasks.lock().unwrap(), id, result);
         if found {
+            if let Some(task) = self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+            {
+                let dir = self.dir.lock().unwrap().clone();
+                let _ = append_record(&dir, &StoreRecord::Task(task));
+            }
             let _ = self.app.emit("conductor-changed", ());
         }
         found
@@ -373,6 +456,17 @@ impl Shared {
     fn mark_delivery_failed(&self, id: &str) {
         let changed = mark_pending_error(&mut self.tasks.lock().unwrap(), id);
         if changed {
+            if let Some(task) = self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+            {
+                let dir = self.dir.lock().unwrap().clone();
+                let _ = append_record(&dir, &StoreRecord::Task(task));
+            }
             let _ = self.app.emit("conductor-changed", ());
         }
     }
@@ -382,7 +476,12 @@ impl Shared {
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
         let t = tasks.iter_mut().find(|t| t.id == id)?;
+        let previous = t.status.clone();
         age(t, now);
+        if t.status != previous {
+            let dir = self.dir.lock().unwrap().clone();
+            let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
+        }
         Some(t.clone())
     }
 
@@ -393,14 +492,25 @@ impl Shared {
     fn tasks_from(&self, from: &str) -> Vec<Task> {
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
-        tasks
+        let mut changed = Vec::new();
+        let result = tasks
             .iter_mut()
             .filter(|t| t.from == from)
             .map(|t| {
+                let previous = t.status.clone();
                 age(t, now);
+                if t.status != previous {
+                    changed.push(t.clone());
+                }
                 t.clone()
             })
-            .collect()
+            .collect();
+        drop(tasks);
+        let dir = self.dir.lock().unwrap().clone();
+        for task in changed {
+            let _ = append_record(&dir, &StoreRecord::Task(task));
+        }
+        result
     }
 
     /// Validate and hand a task to a live session: the shared core of the
@@ -841,8 +951,9 @@ impl BrainHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        age, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
-        mark_pending_error, render_task, Task, TASK_TIMEOUT_MS,
+        age, append_record, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
+        load_brain, mark_pending_error, render_task, AgentSession, Entry, StoreRecord, Task,
+        TASK_TIMEOUT_MS,
     };
 
     #[test]
@@ -1041,6 +1152,77 @@ mod tests {
         age(&mut errored, TASK_TIMEOUT_MS + 1);
         assert_eq!(errored.status, "error");
     }
+
+    #[test]
+    fn durable_brain_round_trips_and_applies_latest_task_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let entry = Entry {
+            kind: "decision".into(),
+            author: "sess-1".into(),
+            topic: "storage".into(),
+            body: "use jsonl".into(),
+            ts_ms: 1,
+            room: "main".into(),
+        };
+        let session = AgentSession {
+            name: "sess-1".into(),
+            kind: "codex".into(),
+        };
+        let pending = Task {
+            id: "task-1".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "test persistence".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 2,
+        };
+        let done = Task {
+            status: "done".into(),
+            result: "passed".into(),
+            ..pending.clone()
+        };
+
+        append_record(&dir, &StoreRecord::Entry(entry.clone())).unwrap();
+        append_record(&dir, &StoreRecord::Session(session.clone())).unwrap();
+        append_record(&dir, &StoreRecord::Task(pending)).unwrap();
+        append_record(&dir, &StoreRecord::Task(done.clone())).unwrap();
+
+        let loaded = load_brain(&dir);
+        assert_eq!(loaded.entries, vec![entry]);
+        assert_eq!(loaded.sessions, vec![session]);
+        assert_eq!(loaded.tasks, vec![done]);
+    }
+
+    #[test]
+    fn durable_brain_ignores_corrupt_and_partial_lines() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let entry = Entry {
+            kind: "fact".into(),
+            author: "sess-1".into(),
+            topic: "safe".into(),
+            body: "valid records survive".into(),
+            ts_ms: 1,
+            room: "main".into(),
+        };
+        append_record(&dir, &StoreRecord::Entry(entry.clone())).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(super::STORE_FILE))
+            .unwrap();
+        file.write_all(b"not json\n{\"type\":\"entry\",\"value\":")
+            .unwrap();
+
+        let loaded = load_brain(&dir);
+        assert_eq!(loaded.entries, vec![entry]);
+        assert!(loaded.sessions.is_empty());
+        assert!(loaded.tasks.is_empty());
+        assert!(load_brain(&temp.path().join("missing")).entries.is_empty());
+    }
 }
 
 /// What every connecting agent is told about the workspace it just joined.
@@ -1147,16 +1329,17 @@ pub fn start(
     dir: PathBuf,
     engine: Arc<crate::SessionManager>,
 ) -> std::io::Result<(u16, Arc<Shared>)> {
+    let brain = load_brain(&dir);
     let shared = Arc::new(Shared {
         app,
         dir: Mutex::new(dir),
-        entries: Mutex::new(Vec::new()),
-        sessions: Mutex::new(Vec::new()),
+        entries: Mutex::new(brain.entries),
+        sessions: Mutex::new(brain.sessions),
         name_to_room: Mutex::new(HashMap::new()),
         engine,
         conductor: Mutex::new(None),
         halted: Mutex::new(false),
-        tasks: Mutex::new(Vec::new()),
+        tasks: Mutex::new(brain.tasks),
         dispatches: Mutex::new(0),
     });
 
