@@ -583,9 +583,168 @@ fn agent_mcp_wiring(
     }
 }
 
+/// Why isolation could not be provided. Separate from the message so the
+/// frontend can branch on the cause rather than parse prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IsolationReason {
+    /// The directory the session would run in is not inside a git repository, so
+    /// there is nothing to cut a worktree from. Previously this path did not even
+    /// log — the `if let Some(root)` simply fell through and the session ran
+    /// shared.
+    NotARepository,
+    /// The repository was found but `git worktree add` failed.
+    WorktreeCreateFailed,
+}
+
+/// The detail behind a refused isolated spawn. Carries what a user needs to
+/// decide between retrying and deliberately continuing without isolation, which
+/// is the choice this error exists to put in front of them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IsolationFailure {
+    pub reason: IsolationReason,
+    /// The session that was refused, so the frontend can match this to the pane
+    /// that asked.
+    pub session_id: String,
+    /// The directory isolation was requested for.
+    pub project: String,
+    /// The underlying git/IO error, verbatim. Empty for `NotARepository`, which
+    /// has no underlying failure — the precondition simply is not met.
+    pub detail: String,
+    /// Whether retrying could plausibly succeed. A worktree creation failure is
+    /// often transient (a stale lock, a full disk); a non-repository will not
+    /// become one by retrying, so offering "retry" there would be a dead end.
+    pub retryable: bool,
+}
+
+/// Discriminates the one error the frontend must treat specially from every
+/// other way a spawn can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SpawnErrorKind {
+    /// An ordinary spawn failure.
+    Failed,
+    /// Isolation was requested and could not be provided, so nothing was
+    /// spawned. Distinct because the remedy is a user decision, not a retry.
+    IsolationUnavailable,
+}
+
+/// A spawn failure as the frontend receives it.
+///
+/// `message` is always populated, so any generic error path still has something
+/// to show; `kind` and `isolation` are what let the launcher offer retry or
+/// continue-unisolated instead of a dead end.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnError {
+    pub kind: SpawnErrorKind,
+    pub message: String,
+    /// Present only when `kind` is `IsolationUnavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationFailure>,
+}
+
+impl SpawnError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            kind: SpawnErrorKind::Failed,
+            message: message.into(),
+            isolation: None,
+        }
+    }
+
+    fn isolation(
+        reason: IsolationReason,
+        session_id: &str,
+        project: &Path,
+        detail: impl Into<String>,
+    ) -> Self {
+        let detail = detail.into();
+        let project = project.to_string_lossy().to_string();
+        let message = match reason {
+            IsolationReason::NotARepository => format!(
+                "Isolation was requested for session {session_id}, but {project} is not inside a \
+                 git repository, so no worktree could be created. The session was not started."
+            ),
+            IsolationReason::WorktreeCreateFailed => format!(
+                "Isolation was requested for session {session_id}, but creating a git worktree in \
+                 {project} failed: {detail}. The session was not started."
+            ),
+        };
+        Self {
+            kind: SpawnErrorKind::IsolationUnavailable,
+            message,
+            isolation: Some(IsolationFailure {
+                reason,
+                session_id: session_id.to_string(),
+                project,
+                detail,
+                retryable: matches!(reason, IsolationReason::WorktreeCreateFailed),
+            }),
+        }
+    }
+}
+
+/// Lets the existing `.map_err(|e| e.to_string())?` sites keep working, so the
+/// structured type is additive rather than a rewrite of every failure path.
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self::failed(message)
+    }
+}
+
+/// Decide where a session runs, refusing to start at all if isolation was asked
+/// for and cannot be delivered.
+///
+/// This used to fall back to the shared project directory and note it with an
+/// `eprintln!` that never reaches the app, so a user who asked for isolation got
+/// a session running directly in their project while the UI showed it as
+/// isolated. Isolation is a safety property the user explicitly requested; the
+/// one thing it must not do is quietly become nothing. Downgrading it is now the
+/// user's decision to make, which means it has to reach them as an error.
+///
+/// Split from `spawn_session` so the policy is testable without a Tauri command:
+/// `create` is injected so a test can force the failure branch and keep real
+/// worktrees out of the user's app-data directory.
+fn resolve_isolation<F>(
+    isolate: bool,
+    session_id: &str,
+    project: &Path,
+    create: F,
+) -> Result<(PathBuf, Option<worktree::Worktree>), SpawnError>
+where
+    F: FnOnce(&Path, &str) -> Result<worktree::Worktree, String>,
+{
+    if !isolate {
+        return Ok((project.to_path_buf(), None));
+    }
+    let Some(root) = worktree::repo_root(project) else {
+        return Err(SpawnError::isolation(
+            IsolationReason::NotARepository,
+            session_id,
+            project,
+            "",
+        ));
+    };
+    match create(&root, session_id) {
+        Ok(w) => Ok((w.path.clone(), Some(w))),
+        Err(e) => Err(SpawnError::isolation(
+            IsolationReason::WorktreeCreateFailed,
+            session_id,
+            project,
+            e,
+        )),
+    }
+}
+
 /// Spawn a session under `session_id` and stream its output over `channel` until
 /// the child exits. Returns as soon as streaming ends; the frontend fires it
 /// without awaiting and addresses the session by the id it supplied.
+///
+/// Fails closed on isolation: if `isolate` was requested and no worktree could be
+/// created, this returns `SpawnErrorKind::IsolationUnavailable` and starts
+/// nothing, rather than silently running the session in the shared project dir.
 #[tauri::command]
 async fn spawn_session(
     app: AppHandle,
@@ -600,14 +759,16 @@ async fn spawn_session(
     cols: u16,
     cwd: Option<String>,
     isolate: Option<bool>,
-) -> Result<(), String> {
+) -> Result<(), SpawnError> {
     // Refuse a session id that is already live. Inserting over one would replace
     // the handle without killing the process or removing its worktree, orphaning
     // both. This early check only saves work — it cannot be authoritative,
     // because nothing stops a second spawn passing it before the first inserts.
     // The binding check is inside the spawn lock below.
     if state.sessions.lock().unwrap().contains_key(&session_id) {
-        return Err(format!("session {session_id} is already running"));
+        return Err(SpawnError::failed(format!(
+            "session {session_id} is already running"
+        )));
     }
 
     // Decide where this session runs: the project dir, or its own git worktree
@@ -616,22 +777,17 @@ async fn spawn_session(
     let project = cwd
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let mut session_cwd = project.clone();
     // Everything created from here until the SessionHandle exists is owned by this
-    // guard, so any early return below unwinds it instead of stranding it.
+    // guard, so any early return below unwinds it instead of stranding it. That
+    // includes the isolation refusal below, which is why it is armed first.
     let mut rollback = SpawnRollback::new(session_id.clone());
-    if isolate.unwrap_or(false) {
-        if let Some(root) = worktree::repo_root(&project) {
-            match worktree::create(&root, &session_id) {
-                Ok(w) => {
-                    session_cwd = w.path.clone();
-                    rollback.worktree = Some(w);
-                }
-                // Fall back to the project dir rather than failing the launch.
-                Err(e) => eprintln!("[mosaic] worktree create failed: {e}"),
-            }
-        }
-    }
+    let (session_cwd, worktree) = resolve_isolation(
+        isolate.unwrap_or(false),
+        &session_id,
+        &project,
+        worktree::create,
+    )?;
+    rollback.worktree = worktree;
 
     // EVERY session gets its own endpoint, isolated or not. Because that port is
     // only ever handed to this one session, any request arriving on it is
@@ -687,7 +843,9 @@ async fn spawn_session(
         // before the spawn deliberately: losing this race must not leave a live
         // child behind, and the rollback guard only handles inert resources.
         if state.sessions.lock().unwrap().contains_key(&session_id) {
-            return Err(format!("session {session_id} is already running"));
+            return Err(SpawnError::failed(format!(
+                "session {session_id} is already running"
+            )));
         }
 
         let mut cmd = build_command(&program, &args, &session_cwd, &extra_env);
@@ -936,11 +1094,13 @@ fn human_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        delivery_allowance_ms, is_agent_cli, is_codex, ready_to_submit, submit_ceiling_ms,
-        submit_floor_ms, validate_human_dispatch, worktree, SpawnRollback, SUBMIT_BYTES_PER_MS,
-        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        delivery_allowance_ms, is_agent_cli, is_codex, ready_to_submit, resolve_isolation,
+        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, IsolationReason,
+        SpawnErrorKind, SpawnRollback, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS,
+        SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     /// A temp repo plus one worktree created inside it, standing in for the state
@@ -1006,6 +1166,158 @@ mod tests {
         assert!(
             path.join("in-progress.txt").exists(),
             "rollback must not discard uncommitted work"
+        );
+    }
+
+    // Isolation must fail closed. It used to fall back to the shared project
+    // directory and note it with an eprintln! that never reaches the app, so a
+    // user who asked for isolation got a session running loose in their project
+    // while the UI showed it as isolated — a safety property they explicitly
+    // asked for, silently downgraded to nothing.
+
+    /// Stands in for `worktree::create` when a test needs the failure branch.
+    /// Injected rather than provoked so the case is deterministic and no real
+    /// worktree is created in the user's app-data directory.
+    fn create_fails(_repo: &Path, _session_id: &str) -> Result<worktree::Worktree, String> {
+        Err("fatal: could not lock ref: File exists".into())
+    }
+
+    /// `worktree::Worktree` deliberately has no `Debug`, so `expect_err` cannot be
+    /// used on what `resolve_isolation` returns.
+    fn expect_refusal(
+        result: Result<(PathBuf, Option<worktree::Worktree>), super::SpawnError>,
+        context: &str,
+    ) -> super::SpawnError {
+        match result {
+            Ok(_) => panic!("{context}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn isolation_requested_but_unavailable_refuses_to_spawn() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        worktree::init_test_repo(&repo).unwrap();
+
+        let err = expect_refusal(
+            resolve_isolation(true, "sess-iso-fail", &repo, create_fails),
+            "a session that asked for isolation must not start without it",
+        );
+
+        assert_eq!(err.kind, SpawnErrorKind::IsolationUnavailable);
+        let detail = err.isolation.expect("the frontend needs the cause");
+        assert_eq!(detail.reason, IsolationReason::WorktreeCreateFailed);
+        assert_eq!(detail.session_id, "sess-iso-fail");
+        assert!(
+            detail.retryable,
+            "a lock failure is transient, so retry must be offered"
+        );
+        // The underlying git error has to survive to the user, otherwise the
+        // dialog can only say that something went wrong.
+        assert!(
+            detail.detail.contains("could not lock ref"),
+            "underlying error must reach the frontend, got {:?}",
+            detail.detail
+        );
+        assert!(
+            err.message.contains("not started"),
+            "the message must say nothing was spawned, got {:?}",
+            err.message
+        );
+    }
+
+    // The path that did not even log: `repo_root` returning None skipped the
+    // whole isolation block and the session ran shared in silence.
+    #[test]
+    fn isolation_requested_outside_a_repository_refuses_to_spawn() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("not-a-repo");
+        fs::create_dir_all(&plain).unwrap();
+
+        let err = expect_refusal(
+            resolve_isolation(true, "sess-iso-norepo", &plain, |_, _| {
+                panic!("must not attempt to create a worktree outside a repository")
+            }),
+            "no repository means no isolation, so no spawn",
+        );
+
+        assert_eq!(err.kind, SpawnErrorKind::IsolationUnavailable);
+        let detail = err.isolation.expect("the frontend needs the cause");
+        assert_eq!(detail.reason, IsolationReason::NotARepository);
+        assert!(
+            !detail.retryable,
+            "a directory will not become a repository by retrying"
+        );
+    }
+
+    #[test]
+    fn isolation_requested_and_available_runs_in_the_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        worktree::init_test_repo(&repo).unwrap();
+        let base = tmp.path().to_path_buf();
+
+        let (cwd, worktree) = resolve_isolation(true, "sess-iso-ok", &repo, |r, s| {
+            worktree::create_with_base_dir(r, s, &base)
+        })
+        .expect("isolation that can be provided must still spawn");
+
+        let wt = worktree.expect("the session must own its worktree for cleanup");
+        assert_eq!(cwd, wt.path, "the session must run inside its worktree");
+        assert_ne!(cwd, repo, "an isolated session must not run in the project");
+        assert!(cwd.exists());
+    }
+
+    #[test]
+    fn a_session_that_did_not_ask_for_isolation_is_unaffected() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+
+        // Not a repository, and no worktree may be attempted — an unisolated
+        // session must not acquire a git requirement it never had.
+        let (cwd, worktree) = resolve_isolation(false, "sess-plain", &plain, |_, _| {
+            panic!("must not create a worktree when isolation was not requested")
+        })
+        .expect("an unisolated session must still spawn");
+
+        assert_eq!(cwd, plain, "it runs in the project directory, as before");
+        assert!(worktree.is_none());
+    }
+
+    // Pins the wire contract the launcher UI is being built against.
+    #[test]
+    fn the_isolation_error_serializes_with_the_fields_the_frontend_branches_on() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        worktree::init_test_repo(&repo).unwrap();
+
+        let err = expect_refusal(
+            resolve_isolation(true, "sess-wire", &repo, create_fails),
+            "isolation must be refused here",
+        );
+        let json = serde_json::to_value(&err).unwrap();
+
+        assert_eq!(json["kind"], "isolationUnavailable");
+        assert!(json["message"].is_string());
+        assert_eq!(json["isolation"]["reason"], "worktreeCreateFailed");
+        assert_eq!(json["isolation"]["sessionId"], "sess-wire");
+        assert_eq!(json["isolation"]["retryable"], true);
+        assert!(json["isolation"]["project"].is_string());
+        assert!(json["isolation"]["detail"].is_string());
+
+        // An ordinary failure stays distinguishable, so the launcher only offers
+        // the isolation choice when isolation is actually what went wrong.
+        let ordinary = serde_json::to_value(super::SpawnError::failed("boom")).unwrap();
+        assert_eq!(ordinary["kind"], "failed");
+        assert_eq!(ordinary["message"], "boom");
+        assert!(
+            ordinary.get("isolation").is_none(),
+            "a non-isolation failure must not carry an isolation payload"
         );
     }
 
