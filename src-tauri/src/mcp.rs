@@ -1102,12 +1102,30 @@ impl ServerHandler for BrainHandler {
 /// Bind a loopback endpoint dedicated to ONE session. Because only that session
 /// is registered against this port, every request on it is provably from that
 /// session — identity without a handshake.
-pub fn start_session_server(shared: Arc<Shared>, session_id: String) -> std::io::Result<u16> {
+/// The caller owns the returned handle: dropping it does NOT stop the server, so
+/// it must be aborted explicitly when the session ends, or the listener outlives
+/// the session it was bound to.
+pub struct SessionServer {
+    pub port: u16,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl SessionServer {
+    /// Stop serving. Called when the session is killed or exits on its own.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+pub fn start_session_server(
+    shared: Arc<Shared>,
+    session_id: String,
+) -> std::io::Result<SessionServer> {
     let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     std_listener.set_nonblocking(true)?;
     let port = std_listener.local_addr()?.port();
 
-    tauri::async_runtime::spawn(async move {
+    let task = tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(std_listener) {
             Ok(l) => l,
             Err(_) => return,
@@ -1121,7 +1139,7 @@ pub fn start_session_server(shared: Arc<Shared>, session_id: String) -> std::io:
         let _ = axum::serve(listener, router).await;
     });
 
-    Ok(port)
+    Ok(SessionServer { port, task })
 }
 
 pub fn start(
