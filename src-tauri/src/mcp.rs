@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::response::IntoResponse;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -1017,9 +1018,10 @@ impl BrainHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        age, append_record, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
-        load_brain, mark_pending_error, render_task, task_for_dispatcher, validate_path_component,
-        AgentSession, Entry, StoreRecord, Task, TaskAccessError, TASK_TIMEOUT_MS,
+        age, append_record, bearer_matches, conductor_briefing, dispatch_precheck, dispatch_prompt,
+        finish_pending, load_brain, mark_pending_error, mint_session_token, render_task,
+        task_for_dispatcher, validate_path_component, AgentSession, Entry, StoreRecord, Task,
+        TaskAccessError, TASK_TIMEOUT_MS,
     };
 
     #[test]
@@ -1215,6 +1217,55 @@ mod tests {
     }
 
     #[test]
+    fn a_session_endpoint_accepts_only_its_own_bearer_token() {
+        let token = mint_session_token();
+        assert!(bearer_matches(Some(&format!("Bearer {token}")), &token));
+
+        // Every way a caller can get it wrong.
+        assert!(!bearer_matches(None, &token), "missing header");
+        assert!(!bearer_matches(Some(""), &token), "empty header");
+        assert!(
+            !bearer_matches(Some(&token), &token),
+            "raw token, no scheme"
+        );
+        assert!(
+            !bearer_matches(Some(&format!("Basic {token}")), &token),
+            "wrong scheme"
+        );
+        assert!(
+            !bearer_matches(Some(&format!("bearer {token}")), &token),
+            "scheme is case-sensitive per RFC 6750 usage here"
+        );
+        assert!(
+            !bearer_matches(Some(&format!("Bearer {}", mint_session_token())), &token),
+            "another session's token"
+        );
+        assert!(
+            !bearer_matches(Some(&format!("Bearer {token}x")), &token),
+            "correct prefix, extra byte"
+        );
+        assert!(
+            !bearer_matches(
+                Some(&format!("Bearer {}", &token[..token.len() - 1])),
+                &token
+            ),
+            "correct prefix, truncated"
+        );
+    }
+
+    #[test]
+    fn session_tokens_are_long_and_distinct() {
+        // Guards against a refactor that returns a constant, an empty string,
+        // or something short enough to grind against a loopback port that
+        // imposes no rate limit.
+        let a = mint_session_token();
+        let b = mint_session_token();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 64, "two hyphen-free v4 UUIDs");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn mark_pending_error_records_a_delivery_failure() {
         let mut tasks = vec![Task {
             id: "abc123".into(),
@@ -1407,6 +1458,10 @@ impl ServerHandler for BrainHandler {
 /// the session it was bound to.
 pub struct SessionServer {
     pub port: u16,
+    /// Secret this session must present as `Authorization: Bearer <token>`.
+    /// Handed to the caller so it can be written into that one session's agent
+    /// config; it is never logged and never leaves the machine.
+    pub token: String,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -1415,6 +1470,44 @@ impl SessionServer {
     pub fn shutdown(self) {
         self.task.abort();
     }
+}
+
+/// Mint a secret for one session's endpoint.
+///
+/// Two v4 UUIDs, whose randomness comes from the OS CSPRNG via `getrandom`,
+/// give 244 bits with no new dependency. Far past brute force, which matters
+/// because the endpoint sits on loopback where anything local can reach it and
+/// retry without limit.
+fn mint_session_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Whether an `Authorization` header carries exactly the expected bearer token.
+///
+/// Compared in constant time over the whole candidate so a caller cannot learn
+/// the secret one byte at a time from response latency. Localhost makes that
+/// attack awkward rather than impossible, and the cost of not leaking is a
+/// single XOR per byte. Split out from the middleware so it is directly
+/// testable without standing up a server.
+fn bearer_matches(header: Option<&str>, expected: &str) -> bool {
+    let Some(value) = header else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    if presented.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in presented.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 pub fn start_session_server(
@@ -1426,6 +1519,8 @@ pub fn start_session_server(
     let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     std_listener.set_nonblocking(true)?;
     let port = std_listener.local_addr()?.port();
+    let token = mint_session_token();
+    let expected = token.clone();
 
     let task = tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(std_listener) {
@@ -1437,11 +1532,32 @@ pub fn start_session_server(
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );
-        let router = axum::Router::new().nest_service("/mcp", service);
+        // The port still identifies WHICH session this is; the token proves the
+        // caller is that session rather than any other local process that
+        // guessed the port. Both checks, not one instead of the other.
+        let router =
+            axum::Router::new()
+                .nest_service("/mcp", service)
+                .layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let expected = expected.clone();
+                        async move {
+                            let header = req
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok());
+                            if bearer_matches(header, &expected) {
+                                next.run(req).await
+                            } else {
+                                axum::http::StatusCode::UNAUTHORIZED.into_response()
+                            }
+                        }
+                    },
+                ));
         let _ = axum::serve(listener, router).await;
     });
 
-    Ok(SessionServer { port, task })
+    Ok(SessionServer { port, token, task })
 }
 
 pub fn start(
