@@ -517,10 +517,19 @@ fn validate_human_dispatch(target: &str, task: &str) -> Result<(String, String),
 /// at the mercy of Windows quoting.
 ///
 /// Returns `(extra_args, extra_env)` to fold into the launch.
+/// Env var carrying the bearer token to Codex. Codex takes the NAME of the
+/// variable in its config, not the value, which is what we want: the secret
+/// travels in the environment while only its label appears in `-c` on the
+/// command line. Command lines are readable by any local process; environments
+/// are not, and putting the token in an argument would hand it to exactly the
+/// observer the token exists to stop.
+const CODEX_TOKEN_ENV: &str = "MOSAIC_MCP_TOKEN";
+
 fn agent_mcp_wiring(
     program: &str,
     session_id: &str,
     url: &str,
+    token: Option<&str>,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let prog = program.to_ascii_lowercase();
     let prog = prog.trim_end_matches(".exe").trim_end_matches(".cmd");
@@ -537,7 +546,13 @@ fn agent_mcp_wiring(
         // argument added after this one would be swallowed as a config file.
         "claude" => {
             let path = dir.join("claude-mcp.json");
-            let body = format!(r#"{{"mcpServers":{{"mosaic":{{"type":"http","url":"{url}"}}}}}}"#);
+            let headers = match token {
+                Some(t) => format!(r#","headers":{{"Authorization":"Bearer {t}"}}"#),
+                None => String::new(),
+            };
+            let body = format!(
+                r#"{{"mcpServers":{{"mosaic":{{"type":"http","url":"{url}"{headers}}}}}}}"#
+            );
             match std::fs::write(&path, body) {
                 Ok(_) => (
                     vec![
@@ -554,15 +569,27 @@ fn agent_mcp_wiring(
         }
         // A bare value fails TOML parsing, at which point Codex documents that it
         // falls back to the raw string — which sidesteps nested quoting.
-        "codex" => (
-            vec!["-c".to_string(), format!("mcp_servers.mosaic.url={url}")],
-            vec![],
-        ),
+        "codex" => {
+            let mut args = vec!["-c".to_string(), format!("mcp_servers.mosaic.url={url}")];
+            let mut env = vec![];
+            if let Some(t) = token {
+                args.push("-c".to_string());
+                args.push(format!(
+                    "mcp_servers.mosaic.bearer_token_env_var={CODEX_TOKEN_ENV}"
+                ));
+                env.push((CODEX_TOKEN_ENV.to_string(), t.to_string()));
+            }
+            (args, env)
+        }
         // OPENCODE_CONFIG is merged over the global config, not swapped for it.
         "opencode" => {
             let path = dir.join("opencode.json");
+            let headers = match token {
+                Some(t) => format!(r#","headers":{{"Authorization":"Bearer {t}"}}"#),
+                None => String::new(),
+            };
             let body = format!(
-                r#"{{"$schema":"https://opencode.ai/config.json","mcp":{{"mosaic":{{"type":"remote","url":"{url}"}}}}}}"#
+                r#"{{"$schema":"https://opencode.ai/config.json","mcp":{{"mosaic":{{"type":"remote","url":"{url}"{headers}}}}}}}"#
             );
             match std::fs::write(&path, body) {
                 Ok(_) => (
@@ -642,15 +669,21 @@ async fn spawn_session(
         match mcp::start_session_server(shared.inner().clone(), session_id.clone()) {
             Ok(server) => {
                 let url = format!("http://127.0.0.1:{}/mcp", server.port);
+                let token = server.token.clone();
                 rollback.server = Some(server);
                 shared.note_session(&session_id, &program);
-                agent_mcp_wiring(&program, &session_id, &url)
+                agent_mcp_wiring(&program, &session_id, &url, Some(&token))
             }
             // Endpoint failed: fall back to the shared one. The agent can still reach
             // the brain, it just has to declare who it is.
+            //
+            // No token here: the shared endpoint is not per-session, so there is
+            // nothing session-specific to prove. That endpoint is exactly the
+            // self-declared-identity path audit finding #6 also covers, and it is
+            // still open.
             Err(e) => {
                 eprintln!("[mosaic] session endpoint failed, using shared: {e}");
-                agent_mcp_wiring(&program, &session_id, &mcp.url)
+                agent_mcp_wiring(&program, &session_id, &mcp.url, None)
             }
         };
     let mut args = args;
@@ -936,9 +969,10 @@ fn human_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        delivery_allowance_ms, is_agent_cli, is_codex, ready_to_submit, submit_ceiling_ms,
-        submit_floor_ms, validate_human_dispatch, worktree, SpawnRollback, SUBMIT_BYTES_PER_MS,
-        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        agent_mcp_wiring, delivery_allowance_ms, is_agent_cli, is_codex, ready_to_submit,
+        submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree, SpawnRollback,
+        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
+        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -1209,6 +1243,98 @@ mod tests {
         assert!(validate_human_dispatch("", "task").is_err());
         assert!(validate_human_dispatch("sess-2", "   ").is_err());
         assert!(validate_human_dispatch("   ", "").is_err());
+    }
+
+    // The token is useless if it never reaches the agent, and each CLI takes it
+    // a different way. These pin the three shapes so a config-format change
+    // fails here rather than silently at runtime, where the symptom is a
+    // session that connects and then 401s on every tool call.
+
+    #[test]
+    fn claude_carries_the_token_as_an_authorization_header() {
+        let (args, env) = agent_mcp_wiring(
+            "claude",
+            "sess-tok-claude",
+            "http://127.0.0.1:1/mcp",
+            Some("secret123"),
+        );
+        let path = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .map(|i| args[i + 1].clone())
+            .expect("claude gets a --mcp-config path");
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(
+            body.contains(r#""Authorization":"Bearer secret123""#),
+            "{body}"
+        );
+        assert!(
+            env.is_empty(),
+            "claude reads the token from its config file"
+        );
+    }
+
+    #[test]
+    fn codex_passes_the_token_by_env_var_name_not_by_value() {
+        let (args, env) = agent_mcp_wiring(
+            "codex",
+            "sess-tok-codex",
+            "http://127.0.0.1:1/mcp",
+            Some("secret123"),
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(&format!("bearer_token_env_var={CODEX_TOKEN_ENV}")),
+            "{joined}"
+        );
+        // The whole point: the secret is in the environment, never on the
+        // command line, which any local process can read.
+        assert!(
+            !joined.contains("secret123"),
+            "token leaked into argv: {joined}"
+        );
+        assert!(env.contains(&(CODEX_TOKEN_ENV.to_string(), "secret123".to_string())));
+    }
+
+    #[test]
+    fn opencode_carries_the_token_as_an_authorization_header() {
+        let (_, env) = agent_mcp_wiring(
+            "opencode",
+            "sess-tok-oc",
+            "http://127.0.0.1:1/mcp",
+            Some("secret123"),
+        );
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_CONFIG")
+            .map(|(_, v)| v.clone())
+            .expect("opencode gets OPENCODE_CONFIG");
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(
+            body.contains(r#""Authorization":"Bearer secret123""#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn no_token_means_no_auth_stanza_anywhere() {
+        // The shared-endpoint fallback has no per-session secret to present.
+        // It must still produce a config the agent can load, not one with an
+        // empty or malformed Authorization header.
+        let (args, _) = agent_mcp_wiring("claude", "sess-tok-none", "http://127.0.0.1:1/mcp", None);
+        let path = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .map(|i| args[i + 1].clone())
+            .unwrap();
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(!body.contains("Authorization"), "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).expect("still valid JSON without a token");
+
+        let (args, env) =
+            agent_mcp_wiring("codex", "sess-tok-none2", "http://127.0.0.1:1/mcp", None);
+        assert!(!args.join(" ").contains("bearer_token_env_var"));
+        assert!(env.is_empty());
     }
 }
 
