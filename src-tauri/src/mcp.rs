@@ -113,6 +113,7 @@ enum StoreRecord {
     Entry(Entry),
     Session(AgentSession),
     Task(Task),
+    LegacyMarkdownImported,
 }
 
 #[derive(Default)]
@@ -123,10 +124,9 @@ struct StoredBrain {
 }
 
 fn load_brain(dir: &Path) -> StoredBrain {
-    let Ok(contents) = fs::read_to_string(dir.join(STORE_FILE)) else {
-        return StoredBrain::default();
-    };
+    let contents = fs::read_to_string(dir.join(STORE_FILE)).unwrap_or_default();
     let mut brain = StoredBrain::default();
+    let mut legacy_markdown_imported = false;
     for record in contents
         .lines()
         .filter_map(|line| serde_json::from_str::<StoreRecord>(line).ok())
@@ -147,9 +147,93 @@ fn load_brain(dir: &Path) -> StoredBrain {
                     brain.tasks.push(task);
                 }
             }
+            StoreRecord::LegacyMarkdownImported => legacy_markdown_imported = true,
+        }
+    }
+    if brain.entries.is_empty() && !legacy_markdown_imported {
+        let imported = import_legacy_markdown(dir);
+        if append_legacy_import(dir, &imported).is_ok() {
+            brain.entries.extend(imported);
         }
     }
     brain
+}
+
+fn import_legacy_markdown(dir: &Path) -> Vec<Entry> {
+    let Ok(files) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = files
+        .filter_map(Result::ok)
+        .map(|file| file.path())
+        .collect();
+    paths.sort();
+
+    let mut entries = Vec::new();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((room, kind)) = legacy_file_metadata(name) else {
+            continue;
+        };
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        entries.extend(
+            contents
+                .lines()
+                .filter_map(|line| parse_legacy_entry(line, room, kind)),
+        );
+    }
+    entries
+}
+
+fn legacy_file_metadata(name: &str) -> Option<(&str, &str)> {
+    [
+        ("-decisions.md", "decision"),
+        ("-facts.md", "fact"),
+        ("-broadcasts.md", "broadcast"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, kind)| {
+        name.strip_suffix(suffix)
+            .filter(|room| !room.is_empty())
+            .map(|room| (room, kind))
+    })
+}
+
+fn parse_legacy_entry(line: &str, room: &str, kind: &str) -> Option<Entry> {
+    let rest = line.strip_prefix("- **")?;
+    let (topic, rest) = rest.split_once("** (")?;
+    let (author, body) = rest.split_once("): ")?;
+    if topic.is_empty() || author.is_empty() || body.is_empty() {
+        return None;
+    }
+    Some(Entry {
+        kind: kind.to_string(),
+        author: author.to_string(),
+        topic: topic.to_string(),
+        body: body.to_string(),
+        // Markdown mirrors never recorded time. Zero explicitly means unknown.
+        ts_ms: 0,
+        room: room.to_string(),
+    })
+}
+
+fn append_legacy_import(dir: &Path, entries: &[Entry]) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let mut lines = serde_json::to_string(&StoreRecord::LegacyMarkdownImported)
+        .map_err(std::io::Error::other)?;
+    lines.push('\n');
+    for entry in entries {
+        lines.push_str(
+            &serde_json::to_string(&StoreRecord::Entry(entry.clone()))
+                .map_err(std::io::Error::other)?,
+        );
+        lines.push('\n');
+    }
+    append_line(&dir.join(STORE_FILE), &lines)
 }
 
 fn append_record(dir: &Path, record: &StoreRecord) -> std::io::Result<()> {
@@ -1017,6 +1101,8 @@ impl BrainHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{
         age, append_record, bearer_matches, conductor_briefing, dispatch_precheck, dispatch_prompt,
         finish_pending, load_brain, mark_pending_error, mint_session_token, render_task,
@@ -1391,6 +1477,53 @@ mod tests {
         assert!(loaded.sessions.is_empty());
         assert!(loaded.tasks.is_empty());
         assert!(load_brain(&temp.path().join("missing")).entries.is_empty());
+    }
+
+    #[test]
+    fn legacy_markdown_imports_once_and_preserves_body_punctuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        fs::write(
+            dir.join("main-decisions.md"),
+            "- **storage** (sess-1): use JSONL — it survives restarts\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("review-facts.md"),
+            "- **format** (sess-2): bodies may contain — rationale\n",
+        )
+        .unwrap();
+
+        let first = load_brain(dir);
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(first.entries[0].ts_ms, 0);
+        assert_eq!(first.entries[0].room, "main");
+        assert_eq!(first.entries[0].body, "use JSONL — it survives restarts");
+        assert_eq!(first.entries[1].kind, "fact");
+        assert_eq!(first.entries[1].room, "review");
+
+        let store_after_first = fs::read_to_string(dir.join(super::STORE_FILE)).unwrap();
+        let second = load_brain(dir);
+        assert_eq!(second.entries, first.entries);
+        assert_eq!(
+            fs::read_to_string(dir.join(super::STORE_FILE)).unwrap(),
+            store_after_first
+        );
+    }
+
+    #[test]
+    fn legacy_markdown_skips_malformed_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("main-broadcasts.md"),
+            "not an entry\n- **missing author**: nope\n- **valid** (sess-1): recovered\n",
+        )
+        .unwrap();
+
+        let loaded = load_brain(temp.path());
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].topic, "valid");
+        assert_eq!(loaded.entries[0].kind, "broadcast");
     }
 }
 
