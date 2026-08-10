@@ -99,7 +99,8 @@ pub struct Task {
     pub from: String,
     pub target: String,
     pub task: String,
-    /// "pending" | "done" | "timeout" | "cancelled" | "error"
+    /// "pending" | "overdue" | "done" | "cancelled" | "error".
+    /// "overdue" is non-terminal: still running, result still accepted.
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
@@ -162,7 +163,18 @@ fn append_record(dir: &Path, record: &StoreRecord) -> std::io::Result<()> {
 /// Guardrails. Note that depth is bounded structurally: only the conductor may
 /// dispatch, so a dispatched agent cannot dispatch onward.
 const MAX_DISPATCHES: u32 = 40;
-const TASK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+/// How long before a still-running task is reported as "overdue".
+///
+/// This is a reporting threshold, not a deadline. Nothing here cancels an
+/// agent: the dispatched CLI keeps working, and its `complete_task` call is
+/// still accepted afterwards. Crossing this line only changes what the
+/// conductor is told, so that a slow task is visible without its result being
+/// thrown away.
+///
+/// Twenty minutes because real dispatched work routinely runs past ten. A
+/// threshold most tasks trip is noise, and noise gets ignored.
+const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 
 /// A task record was created and delivery was attempted. `delivered` is false
 /// when the prompt could not be written to the target's terminal — the task
@@ -478,7 +490,7 @@ impl Shared {
         }
     }
 
-    /// Look a task up, flipping it to "timeout" if it has aged out.
+    /// Look a task up, flipping it to "overdue" if it has aged out.
     fn task_status(&self, caller: &str, id: &str) -> Result<Task, TaskAccessError> {
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
@@ -570,18 +582,31 @@ impl Shared {
     }
 }
 
-/// Age a single task in place: still-pending past the timeout becomes
-/// "timeout". Shared by `task_status` (one id) and `tasks_from` (a whole
+/// Age a single task in place: still-pending past the threshold becomes
+/// "overdue". Shared by `task_status` (one id) and `tasks_from` (a whole
 /// list), which used to duplicate this check inline.
+///
+/// "overdue" is deliberately not terminal. The agent is still running and its
+/// result is still accepted, so this only marks the task as slow.
 fn age(t: &mut Task, now: u64) {
-    if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_TIMEOUT_MS {
-        t.status = "timeout".to_string();
+    if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_OVERDUE_MS {
+        t.status = "overdue".to_string();
     }
 }
 
-/// The core of `finish_task`: flip a task from "pending" to "done", but only
-/// if it is still pending. Pure over a task list, with no lock or emit, so the
-/// state transition can be tested directly.
+/// States a dispatched agent may still report a result from.
+///
+/// "overdue" belongs here and its absence was a real bug: a task that aged out
+/// could never be completed, so an agent that did the whole job came back to
+/// report and was refused, and the work was discarded. Nothing ever cancelled
+/// that agent, so the wall clock alone decided the result was worthless.
+fn accepts_result(status: &str) -> bool {
+    matches!(status, "pending" | "overdue")
+}
+
+/// The core of `finish_task`: flip a task to "done" if it is still awaiting a
+/// result. Pure over a task list, with no lock or emit, so the state
+/// transition can be tested directly.
 #[derive(Debug, PartialEq)]
 enum TaskAccessError {
     NotFound,
@@ -597,7 +622,9 @@ fn finish_pending(
 ) -> Result<(), TaskAccessError> {
     match tasks.iter_mut().find(|t| t.id == id) {
         Some(t) if t.target != caller => Err(TaskAccessError::Forbidden),
-        Some(t) if t.status != "pending" => Err(TaskAccessError::NotPending),
+        // Genuinely terminal states still refuse: a cancelled task should not
+        // resurrect, and a completed one should not be silently rewritten.
+        Some(t) if !accepts_result(&t.status) => Err(TaskAccessError::NotPending),
         Some(t) => {
             t.status = "done".to_string();
             t.result = result.to_string();
@@ -970,12 +997,15 @@ impl BrainHandler {
                 "Refused: this task is assigned to a different session.".to_string()
             }
             Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
-            Err(TaskAccessError::NotPending) => format!("Task '{}' is not pending.", p.task_id),
+            Err(TaskAccessError::NotPending) => format!(
+                "Task '{}' is already finished or was cancelled, so no result was recorded.",
+                p.task_id
+            ),
         }
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every task you dispatched at once — do that instead of polling ids one by one. Statuses are pending, done (with the result), timeout or cancelled."
+        description = "Collect the results of work you dispatched. Call with no task_id to get every task you dispatched at once — do that instead of polling ids one by one. Statuses are pending, overdue, done (with the result), error or cancelled. An overdue task is STILL RUNNING and its result is still accepted: it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -1021,7 +1051,7 @@ mod tests {
         age, append_record, bearer_matches, conductor_briefing, dispatch_precheck, dispatch_prompt,
         finish_pending, load_brain, mark_pending_error, mint_session_token, render_task,
         task_for_dispatcher, validate_path_component, AgentSession, Entry, StoreRecord, Task,
-        TaskAccessError, TASK_TIMEOUT_MS,
+        TaskAccessError, TASK_OVERDUE_MS,
     };
 
     #[test]
@@ -1299,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn age_times_out_a_stale_pending_task_but_leaves_other_statuses_alone() {
+    fn age_marks_a_stale_pending_task_overdue_but_leaves_other_statuses_alone() {
         let base = Task {
             id: "a".into(),
             from: "f".into(),
@@ -1311,15 +1341,84 @@ mod tests {
         };
 
         let mut pending = base.clone();
-        age(&mut pending, TASK_TIMEOUT_MS + 1);
-        assert_eq!(pending.status, "timeout");
+        age(&mut pending, TASK_OVERDUE_MS + 1);
+        assert_eq!(pending.status, "overdue");
 
         let mut errored = Task {
             status: "error".into(),
             ..base
         };
-        age(&mut errored, TASK_TIMEOUT_MS + 1);
+        age(&mut errored, TASK_OVERDUE_MS + 1);
         assert_eq!(errored.status, "error");
+    }
+
+    #[test]
+    fn an_overdue_task_still_accepts_its_result() {
+        // The bug this fixes. Nothing cancels a dispatched agent, so one that
+        // ran past the threshold kept working, finished the job, called
+        // complete_task, and was refused. The work was done and thrown away
+        // because a wall clock had moved.
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "long research task".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+
+        age(&mut tasks[0], TASK_OVERDUE_MS + 1);
+        assert_eq!(tasks[0].status, "overdue");
+
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "abc123", "here is the report"),
+            Ok(())
+        );
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(tasks[0].result, "here is the report");
+    }
+
+    #[test]
+    fn genuinely_terminal_states_still_refuse_a_result() {
+        // The tolerance must not resurrect a cancelled task or silently
+        // rewrite one that already reported.
+        for status in ["cancelled", "done", "error"] {
+            let mut tasks = vec![Task {
+                id: "abc123".into(),
+                from: "sess-1".into(),
+                target: "sess-2".into(),
+                task: "t".into(),
+                status: status.into(),
+                result: "original".into(),
+                ts_ms: 0,
+            }];
+            assert_eq!(
+                finish_pending(&mut tasks, "sess-2", "abc123", "late overwrite"),
+                Err(TaskAccessError::NotPending),
+                "{status} must not accept a result"
+            );
+            assert_eq!(tasks[0].result, "original");
+        }
+    }
+
+    #[test]
+    fn an_overdue_task_still_checks_the_caller() {
+        // Accepting late results must not weaken authorization.
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "t".into(),
+            status: "overdue".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-3", "abc123", "stolen"),
+            Err(TaskAccessError::Forbidden)
+        );
+        assert_eq!(tasks[0].status, "overdue");
     }
 
     #[test]

@@ -89,7 +89,10 @@ export type ConductorTask = {
   from: string;
   target: string;
   task: string;
-  status: string; // pending | done | error | timeout | cancelled
+  // pending | overdue | done | error | cancelled.
+  // "overdue" is still running: past the reporting threshold but not
+  // cancelled, and its result is still accepted.
+  status: string;
   result: string;
   ts_ms: number;
 };

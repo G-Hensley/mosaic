@@ -825,7 +825,13 @@ button.ghost.on {
   border-color: var(--acc);
 }
 
-.cond-task[data-status="timeout"],
+/* Overdue is still running, so it must not look like a failure. Amber, full
+   opacity: slow, not dead. */
+.cond-task[data-status="overdue"] {
+  border-color: #e0af68;
+}
+
+.cond-task[data-status="error"],
 .cond-task[data-status="cancelled"] {
   border-color: var(--danger);
   opacity: 0.75;
