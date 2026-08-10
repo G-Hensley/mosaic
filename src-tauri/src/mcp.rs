@@ -253,12 +253,18 @@ impl Shared {
 
     /// Assign an agent name to a brain. Called by the app on spawn and on drag,
     /// so re-homing a running agent takes effect on its next tool call.
-    pub fn set_room(&self, name: &str, room: &str) {
+    fn try_set_room(&self, name: &str, room: &str) -> Result<(), String> {
+        validate_path_component("room", room)?;
         self.name_to_room
             .lock()
             .unwrap()
             .insert(name.to_string(), room.to_string());
         let _ = self.app.emit("context-changed", ());
+        Ok(())
+    }
+
+    pub fn set_room(&self, name: &str, room: &str) {
+        let _ = self.try_set_room(name, room);
     }
 
     /// Append an entry (tagged with the author's current brain) to memory + its
@@ -432,9 +438,9 @@ impl Shared {
         let _ = self.app.emit("conductor-changed", ());
     }
 
-    fn finish_task(&self, id: &str, result: &str) -> bool {
-        let found = finish_pending(&mut self.tasks.lock().unwrap(), id, result);
-        if found {
+    fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<(), TaskAccessError> {
+        let found = finish_pending(&mut self.tasks.lock().unwrap(), caller, id, result);
+        if found.is_ok() {
             if let Some(task) = self
                 .tasks
                 .lock()
@@ -472,17 +478,17 @@ impl Shared {
     }
 
     /// Look a task up, flipping it to "timeout" if it has aged out.
-    fn task_status(&self, id: &str) -> Option<Task> {
+    fn task_status(&self, caller: &str, id: &str) -> Result<Task, TaskAccessError> {
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
-        let t = tasks.iter_mut().find(|t| t.id == id)?;
+        let t = task_for_dispatcher(&mut tasks, caller, id)?;
         let previous = t.status.clone();
         age(t, now);
         if t.status != previous {
             let dir = self.dir.lock().unwrap().clone();
             let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
         }
-        Some(t.clone())
+        Ok(t.clone())
     }
 
     /// Every task a given agent dispatched, aged out the same way `task_status`
@@ -575,17 +581,59 @@ fn age(t: &mut Task, now: u64) {
 /// The core of `finish_task`: flip a task from "pending" to "done", but only
 /// if it is still pending. Pure over a task list, with no lock or emit, so the
 /// state transition can be tested directly.
-fn finish_pending(tasks: &mut [Task], id: &str, result: &str) -> bool {
-    match tasks
-        .iter_mut()
-        .find(|t| t.id == id && t.status == "pending")
-    {
+#[derive(Debug, PartialEq)]
+enum TaskAccessError {
+    NotFound,
+    Forbidden,
+    NotPending,
+}
+
+fn finish_pending(
+    tasks: &mut [Task],
+    caller: &str,
+    id: &str,
+    result: &str,
+) -> Result<(), TaskAccessError> {
+    match tasks.iter_mut().find(|t| t.id == id) {
+        Some(t) if t.target != caller => Err(TaskAccessError::Forbidden),
+        Some(t) if t.status != "pending" => Err(TaskAccessError::NotPending),
         Some(t) => {
             t.status = "done".to_string();
             t.result = result.to_string();
-            true
+            Ok(())
         }
-        None => false,
+        None => Err(TaskAccessError::NotFound),
+    }
+}
+
+fn task_for_dispatcher<'a>(
+    tasks: &'a mut [Task],
+    caller: &str,
+    id: &str,
+) -> Result<&'a mut Task, TaskAccessError> {
+    let task = tasks
+        .iter_mut()
+        .find(|task| task.id == id)
+        .ok_or(TaskAccessError::NotFound)?;
+    if task.from != caller {
+        return Err(TaskAccessError::Forbidden);
+    }
+    Ok(task)
+}
+
+fn validate_path_component(label: &str, value: &str) -> Result<(), String> {
+    let safe = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if safe {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid {label}: use only ASCII letters, digits, '-' and '_'"
+        ))
     }
 }
 
@@ -743,7 +791,9 @@ impl BrainHandler {
         // On a dedicated endpoint Mosaic already knows who you are.
         if let Some(b) = &self.bound {
             if !p.room.is_empty() {
-                self.shared.set_room(b, &p.room);
+                if let Err(e) = self.shared.try_set_room(b, &p.room) {
+                    return format!("Refused: {e}.");
+                }
             }
             return format!("Already identified as '{b}' — Mosaic knows this session.");
         }
@@ -760,7 +810,9 @@ impl BrainHandler {
             all.push(session);
         }
         if !p.room.is_empty() {
-            self.shared.set_room(&p.name, &p.room);
+            if let Err(e) = self.shared.try_set_room(&p.name, &p.room) {
+                return format!("Refused: {e}.");
+            }
         }
         let _ = self.shared.app.emit("context-changed", ());
         format!(
@@ -908,10 +960,16 @@ impl BrainHandler {
 
     #[tool(description = "Report the result of a task the conductor dispatched to you.")]
     fn complete_task(&self, Parameters(p): Parameters<CompleteArgs>) -> String {
-        if self.shared.finish_task(&p.task_id, &p.result) {
-            "Result recorded — the conductor can now read it.".to_string()
-        } else {
-            format!("No pending task '{}'.", p.task_id)
+        match self
+            .shared
+            .finish_task(&self.author(), &p.task_id, &p.result)
+        {
+            Ok(()) => "Result recorded — the conductor can now read it.".to_string(),
+            Err(TaskAccessError::Forbidden) => {
+                "Refused: this task is assigned to a different session.".to_string()
+            }
+            Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
+            Err(TaskAccessError::NotPending) => format!("Task '{}' is not pending.", p.task_id),
         }
     }
 
@@ -920,9 +978,17 @@ impl BrainHandler {
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
-            return match self.shared.task_status(&p.task_id) {
-                None => format!("No task '{}'.", p.task_id),
-                Some(t) => render_task(&t),
+            return match self.shared.task_status(&self.author(), &p.task_id) {
+                Ok(t) => render_task(&t),
+                Err(TaskAccessError::Forbidden) => {
+                    "Refused: this task was dispatched by a different session.".to_string()
+                }
+                Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
+                // `task_status` looks a task up without caring about its state,
+                // so this arm is unreachable today. Answering instead of
+                // `unreachable!()` keeps a future change to that lookup from
+                // turning a lookup into a panic inside a live tool call.
+                Err(TaskAccessError::NotPending) => format!("No task '{}'.", p.task_id),
             };
         }
 
@@ -952,8 +1018,8 @@ impl BrainHandler {
 mod tests {
     use super::{
         age, append_record, conductor_briefing, dispatch_precheck, dispatch_prompt, finish_pending,
-        load_brain, mark_pending_error, render_task, AgentSession, Entry, StoreRecord, Task,
-        TASK_TIMEOUT_MS,
+        load_brain, mark_pending_error, render_task, task_for_dispatcher, validate_path_component,
+        AgentSession, Entry, StoreRecord, Task, TaskAccessError, TASK_TIMEOUT_MS,
     };
 
     #[test]
@@ -1085,7 +1151,10 @@ mod tests {
             result: String::new(),
             ts_ms: 0,
         }];
-        assert!(finish_pending(&mut tasks, "abc123", "found two bugs"));
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs"),
+            Ok(())
+        );
         assert_eq!(tasks[0].status, "done");
         assert_eq!(tasks[0].result, "found two bugs");
     }
@@ -1093,7 +1162,56 @@ mod tests {
     #[test]
     fn finish_pending_refuses_an_unknown_id() {
         let mut tasks: Vec<Task> = vec![];
-        assert!(!finish_pending(&mut tasks, "nope", "result"));
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "nope", "result"),
+            Err(TaskAccessError::NotFound)
+        );
+    }
+
+    #[test]
+    fn complete_task_rejects_a_caller_other_than_the_assigned_target() {
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-3", "abc123", "stolen"),
+            Err(TaskAccessError::Forbidden)
+        );
+        assert_eq!(tasks[0].status, "pending");
+        assert!(tasks[0].result.is_empty());
+    }
+
+    #[test]
+    fn get_task_result_rejects_a_caller_other_than_the_dispatcher() {
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+
+        assert_eq!(
+            task_for_dispatcher(&mut tasks, "sess-3", "abc123").unwrap_err(),
+            TaskAccessError::Forbidden
+        );
+    }
+
+    #[test]
+    fn path_components_reject_room_and_session_traversal() {
+        assert!(validate_path_component("room", "main").is_ok());
+        assert!(validate_path_component("session_id", "sess-1").is_ok());
+        assert!(validate_path_component("room", "../../outside").is_err());
+        assert!(validate_path_component("session_id", "..\\outside").is_err());
     }
 
     #[test]
@@ -1303,6 +1421,8 @@ pub fn start_session_server(
     shared: Arc<Shared>,
     session_id: String,
 ) -> std::io::Result<SessionServer> {
+    validate_path_component("session_id", &session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     std_listener.set_nonblocking(true)?;
     let port = std_listener.local_addr()?.port();
