@@ -984,7 +984,11 @@ impl BrainHandler {
                     "Refused: this task was dispatched by a different session.".to_string()
                 }
                 Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
-                Err(TaskAccessError::NotPending) => unreachable!(),
+                // `task_status` looks a task up without caring about its state,
+                // so this arm is unreachable today. Answering instead of
+                // `unreachable!()` keeps a future change to that lookup from
+                // turning a lookup into a panic inside a live tool call.
+                Err(TaskAccessError::NotPending) => format!("No task '{}'.", p.task_id),
             };
         }
 
