@@ -15,6 +15,25 @@ import {
 import { TERM_FONT } from "../lib/themes";
 import { useAppearance } from "../lib/appearance";
 
+// `spawn_session` rejects with a structured SpawnError, not a string, so that a
+// refusal can say *why*. Interpolating that object directly would print
+// "[object Object]" — swallowing the reason precisely when the user most needs
+// it, since the commonest refusal is "you asked for isolation and could not
+// have it". Non-Tauri rejections (a thrown Error, a plain string) still arrive
+// here, so fall back rather than assume the shape.
+function spawnErrorText(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object" && "message" in e) {
+    const err = e as { message?: unknown; isolation?: { reason?: unknown } };
+    const message = typeof err.message === "string" ? err.message : String(e);
+    // The reason is what tells the user whether to retry, pick a git repo, or
+    // deliberately continue without isolation.
+    const reason = err.isolation?.reason;
+    return typeof reason === "string" ? `${message} (${reason})` : message;
+  }
+  return String(e);
+}
+
 // One xterm terminal bound to one backend session. Owns the terminal lifecycle,
 // the output channel, keystroke write-back, container-driven resize, and live
 // re-theming when the app appearance changes.
@@ -163,7 +182,7 @@ export function TerminalPane({
     spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
       isolate,
       cwd,
-    }).catch((e) => writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${e}\x1b[0m\r\n`));
+    }).catch((e) => writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${spawnErrorText(e)}\x1b[0m\r\n`));
 
     const unlisten = listen<string>("session-exited", (ev) => {
       if (ev.payload === sessionId) {
