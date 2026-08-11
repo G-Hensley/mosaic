@@ -60,27 +60,42 @@ Wants a default window: open tasks plus recently finished ones, with older
 history behind an explicit flag. Filtering by status would also let a conductor
 ask the question it actually has, which is "what am I still waiting on".
 
-## Dispatch can lose the head of a long prompt
+## Dispatch loses exactly the first 1024 bytes of a long prompt
 
-A Codex session received a dispatch that began mid-sentence, at
-`d guard: a zero spending limit...`. The preamble and the first two numbered
-questions were simply absent, and the agent answered a truncated brief while
-correctly flagging that it had done so.
+**Measured, not guessed.** Three Codex dispatches arrived beginning mid-word.
+Locating the survival point in the original text and adding the wrapper that
+`dispatch_prompt` prepends gives the same answer twice:
 
-A follow-up test with a length-matched prompt arrived complete, token and both
-sentinel phrases intact, so this is **not** a simple length limit and not tail
-truncation. Leading bytes are being dropped somewhere between `write_to` and the
-target CLI's input buffer.
+| Dispatch | task chars lost | + prefix | total lost |
+|---|---:|---:|---:|
+| OpenRouter guardrails | 942 | 82 | **1024** |
+| OpenCode timeouts | 942 | 82 | **1024** |
 
-The truncated dispatch was one of four sent in immediate succession; the clean
-one was sent alone to an idle session. Contention during a fan-out is the
-obvious hypothesis and the obvious thing to test first. Note this is distinct
-from the known submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the Enter
-rather than the text.
+Two different prompts of different lengths, both losing exactly 1024 bytes from
+the head. That is a 1 KiB buffer, not a race and not contention, and it kills
+the earlier hypothesis that a concurrent fan-out was to blame.
 
-Silent corruption is worse than a failed dispatch: the agent does plausible work
-on the wrong brief. Whatever the cause, dispatch should verify what landed, or
-fail loudly.
+Short dispatches are unaffected, which is the constraint that makes this
+interesting: if the first 1024 bytes were always dropped, a 200-byte dispatch
+would arrive empty, and those work fine. So the loss appears only once the
+payload exceeds one chunk. A chunked writer whose first chunk is overwritten,
+or lost to a redraw before the target's input is ready, fits the evidence.
+`submit_to` frames Codex payloads with `PASTE_START`/`PASTE_END`, so the codex
+path is the one to inspect first.
+
+**A correction worth keeping.** An earlier entry here claimed a length-matched
+test arrived intact and concluded this was not length-related. That test only
+asked the agent to echo the *final* words and an end token, so it could not have
+detected head truncation and almost certainly lost its own first 1024 bytes into
+the filler. Testing only the end of a message cannot prove the beginning
+arrived.
+
+Silent corruption is worse than a failed dispatch: the agent does competent work
+on the wrong brief, and in two of three cases said so only because it happened
+to notice. Dispatch should verify what landed, or fail loudly.
+
+Distinct from the submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the
+Enter rather than the text.
 
 ## Model-aware dispatch
 
