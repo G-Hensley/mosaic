@@ -8,6 +8,53 @@ code. This file holds capabilities Mosaic does not have yet.
 
 ---
 
+## Local models: pick one that survives a cold start
+
+Solved 2026-08-11, by measurement rather than tuning.
+
+OpenCode enforces a hard **30 second** budget on a request to a local model.
+It is not configurable: `timeout`, `headerTimeout` and `chunkTimeout` exist in
+OpenCode's schema under `provider.<name>.options`, but setting them changed
+nothing on the `/v1/chat/completions` path. Two requests either side of the
+config change took 30.4172622s and 30.5398321s, so the option is simply not
+honored there.
+
+Measured against that budget, with OpenCode's ~13.2k-token prompt:
+
+| Model | Size | Warm | Cold |
+|---|---:|---:|---:|
+| `lfm2.5:8b` | 5.6 GB | 9.6s | **13.9s** |
+| `laguna-xs-2.1` | 20 GB | 11.2s | **32.7s** |
+
+So a 20 GB model is 2.7 seconds too slow on a cold start, every time, and a
+5.6 GB one has 16 seconds of headroom. Nothing here is flaky: a large local
+model works until it idles out of memory, then fails deterministically on the
+next request. That is exactly the "sometimes just stops working" symptom.
+
+**Use small local models for OpenCode panes.** Large ones are viable only if
+they never go cold, which is a guarantee nothing currently makes.
+
+Supporting fixes already applied, both server-side because the client cannot be
+configured:
+
+- `OLLAMA_CONTEXT_LENGTH=32768`. The model's own context length is 262144;
+  Ollama sized the KV cache from it, predicted 27.1 GiB, and evicted the model
+  mid-session. Real usage was 1.2k-14k tokens. Note that `limit.context` in
+  `opencode.json` does **not** control this: it caps what OpenCode will build
+  into a prompt, not what Ollama allocates. Those are different things and
+  conflating them wasted an afternoon.
+- `OLLAMA_KEEP_ALIVE=30m`, up from the 5 minute default, so a thinking agent
+  does not idle its model out and then pay a cold start it cannot afford.
+
+Both are set in the user environment, but Windows only propagates that to
+processes started after a fresh login, so Ollama must be launched from a shell
+that already has them until you log out and back in.
+
+Remaining lever if a bigger local model is ever wanted: shrink the 13.2k-token
+prompt. Unverified whether disabling tools removes their definitions from the
+request or only blocks execution (see sst/opencode#1320); it needs measuring
+with a logging proxy, not assuming.
+
 ## Liveness: tell a slow agent apart from a dead one
 
 Found while testing the overdue fix, and partly caused by it.
