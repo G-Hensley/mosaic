@@ -8,6 +8,47 @@ code. This file holds capabilities Mosaic does not have yet.
 
 ---
 
+## Prior art: nobody has solved the OpenCode local-model timeout
+
+Checked before investing further. Short answer: it is a known, unfixed problem,
+and the one team that documented it in depth gave up and moved to hosted models.
+
+Note the repo moved: `sst/opencode` now redirects to `anomalyco/opencode`.
+
+| Issue | Substance | Status |
+|---|---|---|
+| [#29420](https://github.com/anomalyco/opencode/issues/29420) | Names the cause: the timeout mechanism used `AbortSignal.timeout()`, "which does not work correctly in Bun's runtime", so provider requests had no effective timeout. Proposes a stream watchdog with a **30s first-byte** and 120s idle timeout | **Closed as not planned** |
+| [#2974](https://github.com/anomalyco/opencode/issues/2974) | Config `timeout` "totally ignored" for local providers. The reporter used 900000, the same value I tried | Closed |
+| [#3708](https://github.com/anomalyco/opencode/issues/3708) | Timeouts persist on larger models despite config | Open |
+| [#20466](https://github.com/anomalyco/opencode/issues/20466) | "SSE read timed out" is thrown but the session retry never retries it | Open |
+| [#22132](https://github.com/anomalyco/opencode/issues/22132) | Our exact hang: local Ollama hangs while `/v1/chat/completions` works directly | Open, no root cause, no workaround |
+| [#18428](https://github.com/anomalyco/opencode/issues/18428) | Ollama takes 60-90s via OpenCode vs 3s direct; ~75s of OpenCode-side overhead suspected in streaming logic | **Closed as not planned** |
+
+The 30s first-byte figure in #29420 matches the observed abort exactly, and the
+broken `AbortSignal.timeout()` explains why provider `timeout` values have no
+effect: the binary calls `AbortSignal.timeout(V.timeout)`, which is the
+primitive that issue says does not work under Bun.
+
+An [independent write-up](https://zenn.dev/masafumi_heijo/articles/opencode-ollama-timeout-tui-hang)
+reached the same conclusion by a different route, including the distinction
+that matters here: timeouts took effect under `opencode run` but not in the
+interactive TUI. Their phrasing is worth keeping, since it describes most of
+today: *"added and effective are two different problems."* They abandoned local
+Ollama and standardised on Claude.
+
+**The only workaround anyone confirms** is a third-party plugin,
+[Mte90/opencode-auto-resume](https://github.com/Mte90/opencode-auto-resume),
+which auto-resumes on timeout or error and exposes `chunkTimeoutMs`
+(default 45000). Worth evaluating, but it resumes after a failure rather than
+preventing one; pre-warming avoids the failure altogether and needs no plugin.
+
+**What appears to be new signal:** no issue documents the TUI-versus-headless
+asymmetry. Everything upstream reports the hang without noticing that
+`opencode run` survives the same request. Measured here at 33.2s and 32.7s
+headless against 30.4s and 30.5s cancelled in a pane. That is worth filing
+upstream, since it localises the bug to the interactive path and is cheap for a
+maintainer to reproduce.
+
 ## Dispatch headlessly (`opencode run`) instead of typing into the TUI
 
 The 30 second ceiling on local-model requests is **not** an OpenCode-wide
