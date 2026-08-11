@@ -8,6 +8,43 @@ code. This file holds capabilities Mosaic does not have yet.
 
 ---
 
+## Dispatch headlessly (`opencode run`) instead of typing into the TUI
+
+The 30 second ceiling on local-model requests is **not** an OpenCode-wide
+limit. It belongs to the interactive session path only.
+
+Measured both ways against a deliberately cold 20 GB model, which needs about
+33s:
+
+| Path | Ollama request | Outcome |
+|---|---:|---|
+| Mosaic pane (interactive TUI) | 30.4s, 30.5s | **cancelled both times** |
+| `opencode run` (headless) | 33.2s, 32.7s | **completed both times** |
+
+Two headless runs comfortably exceeded the limit that kills every pane request.
+`BUN_CONFIG_HTTP_IDLE_TIMEOUT` made no difference and is not the cause; it was
+tested and refuted rather than assumed.
+
+Provider options cannot raise the pane ceiling either, and the compiled binary
+shows why: the fetch wrapper collects abort signals and calls
+`AbortSignal.any()`, which fires on the earliest. A signal is already attached
+upstream (`t.signal`) before `timeout` / `headerTimeout` / `chunkTimeout` are
+appended, so a longer value can never win.
+
+So Mosaic has an architectural option worth weighing. It currently drives agents
+by typing into an interactive CLI, which is what makes dispatch fragile in two
+separate ways already documented here: the 1024-byte head truncation and this
+30s ceiling. Running non-interactive work through `opencode run -m
+provider/model "..."` would sidestep both, and would make large local models
+usable, since laguna answers in 1.1s warm and only ever fails on a cold start it
+is not allowed to finish.
+
+The tradeoff is real and should not be waved away: the interactive pane is the
+product. A user watching an agent work in a terminal is the point of Mosaic, and
+a headless dispatch is invisible. A hybrid, where interactive panes stay as they
+are and dispatched tasks run headlessly against the same session, is the shape
+worth exploring, not a wholesale change.
+
 ## Local models: pick one that survives a cold start
 
 Solved 2026-08-11, by measurement rather than tuning.
