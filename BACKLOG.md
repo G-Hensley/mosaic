@@ -22,6 +22,21 @@ Observed directly: three OpenCode panes, only two `opencode` processes alive,
 and the third pane's task stuck at "overdue" with `complete_task` never called.
 Nothing in Mosaic noticed the process was gone.
 
+That pane was running **Laguna XS 2.1 locally through Ollama**, not a hosted
+model, and the operator reports local models stopping like this is recurring
+rather than a one-off. So this is not an exotic edge case to design around
+loosely: on this machine it is the expected failure mode of an entire class of
+session, and the pane most likely to die silently is the one whose work is
+cheapest to hand out.
+
+Two consequences worth separating:
+
+- **Detection** is the item below: a dead pane's task must reach a terminal
+  state.
+- **Routing** belongs with model-aware dispatch: local panes are the wrong
+  target for long, unattended, or on-the-critical-path work, however cheap they
+  are. Cost is not the only axis; delivery probability is one too.
+
 "overdue" is honest about not knowing, which is better than a false "timeout".
 But Mosaic does know something it is not using: it spawned the process and can
 see whether it is still running.
@@ -155,3 +170,22 @@ constrain what it launches, so this may belong in OpenCode's own config
 (generated from `.agents/`, per the toolkit's sync) rather than in Mosaic. If
 Mosaic enforces it, it needs a way to observe the model actually in use, which
 it does not have today.
+
+**Partly done, 2026-08-11.** `~/.config/opencode/opencode.json` now pins both
+`model` and `small_model` to `openrouter/openrouter/free`, the Free Models
+Router, with `max_price` zeros and `allow_fallbacks: false`.
+
+The router is a better guard than pinning one `:free` model, for a reason worth
+keeping: it cannot drift to a paid model, and it survives a model leaving the
+free pool. That is not hypothetical, `inclusionai/ling-3.0-flash:free` had
+already disappeared between the MODEL-GUIDE snapshot and the live catalogue.
+Its tradeoff is no stable model identity between requests.
+
+Care is needed with the sibling routers. `openrouter/free` prices prompt and
+completion at 0, but `openrouter/auto`, `openrouter/fusion`, and
+`openrouter/pareto-code` all report `-1`, meaning variable and billable. Pinning
+the wrong router looks equally tidy and spends money.
+
+Still outstanding, and still the only real guarantee: the account-side state
+(zero balance, auto top-up off, payment method removed, no BYOK keys). Config
+is declared intent; the balance is the enforcement.
