@@ -8,6 +8,65 @@ code. This file holds capabilities Mosaic does not have yet.
 
 ---
 
+## Liveness: tell a slow agent apart from a dead one
+
+Found while testing the overdue fix, and partly caused by it.
+
+Before, a task past the threshold flipped to "timeout" and its result was
+refused. That was wrong, and it is fixed. But the fix traded one failure for
+another: a task is now **never** terminal on its own. If the agent process dies,
+its task sits at "overdue" forever and the conductor waits on a result that can
+never arrive.
+
+Observed directly: three OpenCode panes, only two `opencode` processes alive,
+and the third pane's task stuck at "overdue" with `complete_task` never called.
+Nothing in Mosaic noticed the process was gone.
+
+"overdue" is honest about not knowing, which is better than a false "timeout".
+But Mosaic does know something it is not using: it spawned the process and can
+see whether it is still running.
+
+- Mark a task `abandoned` when its target session's process is gone. That is a
+  real terminal state, distinct from "cancelled" (deliberate) and from
+  "overdue" (still working).
+- Surface pane liveness in `list_sessions`, so a conductor does not dispatch
+  into a dead pane in the first place.
+- Consider whether a dead pane's task should be re-dispatchable to another
+  session, and whether that should be automatic or offered.
+
+## `get_task_result` with no id outgrows its own response limit
+
+It returns every task ever dispatched. At 28 tasks that is already ~67k
+characters, which exceeds the tool response limit and fails outright, so the
+documented way to collect a fan-out breaks exactly when a workspace has been
+used for a while.
+
+Wants a default window: open tasks plus recently finished ones, with older
+history behind an explicit flag. Filtering by status would also let a conductor
+ask the question it actually has, which is "what am I still waiting on".
+
+## Dispatch can lose the head of a long prompt
+
+A Codex session received a dispatch that began mid-sentence, at
+`d guard: a zero spending limit...`. The preamble and the first two numbered
+questions were simply absent, and the agent answered a truncated brief while
+correctly flagging that it had done so.
+
+A follow-up test with a length-matched prompt arrived complete, token and both
+sentinel phrases intact, so this is **not** a simple length limit and not tail
+truncation. Leading bytes are being dropped somewhere between `write_to` and the
+target CLI's input buffer.
+
+The truncated dispatch was one of four sent in immediate succession; the clean
+one was sent alone to an idle session. Contention during a fan-out is the
+obvious hypothesis and the obvious thing to test first. Note this is distinct
+from the known submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the Enter
+rather than the text.
+
+Silent corruption is worse than a failed dispatch: the agent does plausible work
+on the wrong brief. Whatever the cause, dispatch should verify what landed, or
+fail loudly.
+
 ## Model-aware dispatch
 
 Today the conductor knows a session's id and CLI (`sess-3 (opencode)`) and
