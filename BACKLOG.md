@@ -171,6 +171,17 @@ see whether it is still running.
   "overdue" (still working).
 - Surface pane liveness in `list_sessions`, so a conductor does not dispatch
   into a dead pane in the first place.
+
+Confirmed again 2026-08-12, in the shape that matters most. Two of five panes
+took a task at the start of a long session and never returned anything at all.
+Both were still listed by `list_sessions` as ordinary dispatch targets for the
+entire session, with nothing distinguishing them from the three panes doing
+real work. The conductor's only signal was the absence of a result, which is
+indistinguishable from slowness, so it kept the tasks open and eventually
+re-dispatched the same work to a pane that was answering. `list_sessions` is
+the natural place to fix this precisely because it is the call a conductor makes
+*before* choosing a target, and it is currently the one call that cannot be
+wrong in a useful way: it reports presence, and presence is not readiness.
 - Consider whether a dead pane's task should be re-dispatchable to another
   session, and whether that should be automatic or offered.
 
@@ -181,24 +192,55 @@ characters, which exceeds the tool response limit and fails outright, so the
 documented way to collect a fan-out breaks exactly when a workspace has been
 used for a while.
 
+Second data point, 2026-08-12: **39 tasks, 111,770 characters**, still growing
+roughly linearly at ~2.8k per task. The failure is worse than "it errors",
+because the harness spills the payload to a file and instructs the caller to
+read all of it back in chunks. So the documented collection path now costs more
+context than the results are worth, and a conductor that follows the tool's own
+advice burns its window on prompts it already sent. Every collection in that
+session had to fall back to polling ids one at a time, which is exactly what the
+tool description tells you not to do.
+
 Wants a default window: open tasks plus recently finished ones, with older
 history behind an explicit flag. Filtering by status would also let a conductor
 ask the question it actually has, which is "what am I still waiting on".
 
-## Dispatch loses exactly the first 1024 bytes of a long prompt
+## Dispatch loses whole 1 KiB chunks from the head of a long prompt
 
 **Measured, not guessed.** Three Codex dispatches arrived beginning mid-word.
 Locating the survival point in the original text and adding the wrapper that
 `dispatch_prompt` prepends gives the same answer twice:
 
-| Dispatch | task chars lost | + prefix | total lost |
-|---|---:|---:|---:|
-| OpenRouter guardrails | 942 | 82 | **1024** |
-| OpenCode timeouts | 942 | 82 | **1024** |
+| Dispatch | target | payload | task chars lost | + prefix | total lost |
+|---|---|---:|---:|---:|---:|
+| OpenRouter guardrails | codex | - | 942 | 82 | **1024** |
+| OpenCode timeouts | codex | - | 942 | 82 | **1024** |
+| agent-toolkit review | **opencode** | 2645 | 1966 | 82 | **2048** |
 
 Two different prompts of different lengths, both losing exactly 1024 bytes from
 the head. That is a 1 KiB buffer, not a race and not contention, and it kills
 the earlier hypothesis that a concurrent fan-out was to blame.
+
+**Two corrections from a third measurement, 2026-08-12.**
+
+*It is not a fixed 1024 bytes.* A 2645-byte payload lost exactly 2048, which is
+two whole chunks. So the loss scales with size: every complete leading 1 KiB
+chunk is dropped and only the trailing partial chunk arrives. Check the arithmetic
+against all three rows: 2645 = 2x1024 + 597 survived; the codex rows lost one
+chunk each and kept their remainders. "Loses exactly 1024" was true of the sample,
+not of the mechanism, and a fix validated only against ~2 KiB prompts would look
+correct while still corrupting longer ones.
+
+*It is not codex-specific.* This row is an **opencode** pane. The entry below
+points at `submit_to`'s `PASTE_START`/`PASTE_END` framing as the place to look
+first, and that framing is codex-only, so it cannot be the whole cause. Whatever
+drops the chunks sits in the shared write path, not in per-CLI framing.
+
+The same session lost three dispatches to the same opencode pane this way. Each
+time the agent noticed and said so, which is luck: it answered the questions it
+received and never knew the earlier ones existed. Two of three reviews came back
+half-answered for this reason, and the missing half contained a real bug when it
+was finally asked in a shorter prompt.
 
 Short dispatches are unaffected, which is the constraint that makes this
 interesting: if the first 1024 bytes were always dropped, a 200-byte dispatch
