@@ -154,11 +154,27 @@ pub struct Task {
     pub from: String,
     pub target: String,
     pub task: String,
-    /// "pending" | "overdue" | "done" | "cancelled" | "error".
+    /// "pending" | "overdue" | "in_review" | "rework" | "done" | "cancelled" | "error".
     /// "overdue" is non-terminal: still running, result still accepted.
+    /// "in_review" and "rework" are also non-terminal: the work exists but has
+    /// not been signed off, which is the whole point of them being distinct
+    /// from "done".
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
+    /// Session that must sign off before this counts as done. Empty means the
+    /// conductor waived review, which is the honest way to express "a typo fix
+    /// does not need a round trip" without leaving it to whoever remembers.
+    ///
+    /// `serde(default)` is load-bearing: every task already written to
+    /// `brain.jsonl` predates this field, and a workspace must not lose its
+    /// history to a schema change.
+    #[serde(default)]
+    pub reviewer: String,
+    /// What the reviewer said, kept whether they approved or rejected. A
+    /// rejection whose reasons are discarded makes the next attempt guesswork.
+    #[serde(default)]
+    pub findings: String,
 }
 
 const STORE_FILE: &str = "brain.jsonl";
@@ -239,6 +255,10 @@ const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 pub struct DispatchOutcome {
     pub task_id: String,
     pub delivered: bool,
+    /// Who will review it, empty when nobody will. Reported back because the
+    /// conductor usually did not choose this: omitting a reviewer picks one,
+    /// and a conductor that is not told which cannot follow up.
+    pub reviewer: String,
 }
 
 /// The checks a dispatch must pass before any task record is created, in the
@@ -578,23 +598,51 @@ impl Shared {
         self.app.emit("conductor-changed");
     }
 
-    fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<(), TaskAccessError> {
-        let found = finish_pending(&mut self.tasks.lock().unwrap(), caller, id, result);
-        if found.is_ok() {
-            if let Some(task) = self
-                .tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.id == id)
-                .cloned()
-            {
-                let dir = self.dir.lock().unwrap().clone();
-                let _ = append_record(&dir, &StoreRecord::Task(task));
-            }
-            self.app.emit("conductor-changed");
-        }
-        found
+    fn review_task(
+        &self,
+        caller: &str,
+        id: &str,
+        approved: bool,
+        findings: &str,
+    ) -> Result<Task, TaskAccessError> {
+        review_pending(
+            &mut self.tasks.lock().unwrap(),
+            caller,
+            id,
+            approved,
+            findings,
+        )?;
+        let task = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .ok_or(TaskAccessError::NotFound)?;
+        let dir = self.dir.lock().unwrap().clone();
+        let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+        self.app.emit("context-changed");
+        Ok(task)
+    }
+
+    /// Returns the task, so the caller can tell the agent what actually
+    /// happened to it. "Result recorded" is the wrong thing to say when the
+    /// work has gone to a reviewer and is not finished.
+    fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<Task, TaskAccessError> {
+        finish_pending(&mut self.tasks.lock().unwrap(), caller, id, result)?;
+        let task = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .ok_or(TaskAccessError::NotFound)?;
+        let dir = self.dir.lock().unwrap().clone();
+        let _ = append_record(&dir, &StoreRecord::Task(task.clone()));
+        self.app.emit("conductor-changed");
+        Ok(task)
     }
 
     /// Mark a recorded task as errored when terminal delivery fails. A task
@@ -675,8 +723,15 @@ impl Shared {
         from: &str,
         target: &str,
         task: &str,
+        reviewer: &str,
     ) -> Result<DispatchOutcome, String> {
-        let target_is_live = self.engine.ids().iter().any(|i| i == target);
+        let live = self.engine.ids();
+        let target_is_live = live.iter().any(|i| i == target);
+
+        // Before the budget and before the task is recorded, like every other
+        // refusal here: a dispatch naming an impossible reviewer should cost
+        // nothing and leave nothing to collect.
+        let reviewer = choose_reviewer(reviewer, from, target, &live)?;
 
         // Built before the gate because the size rule needs the finished
         // injection, and the id is part of what it measures. Nothing here
@@ -699,6 +754,8 @@ impl Shared {
             status: "pending".to_string(),
             result: String::new(),
             ts_ms: Self::now_ms(),
+            reviewer: reviewer.clone(),
+            findings: String::new(),
         });
 
         // Typed into the target's terminal, so the human sees every
@@ -712,6 +769,7 @@ impl Shared {
         Ok(DispatchOutcome {
             task_id: id,
             delivered,
+            reviewer,
         })
     }
 }
@@ -765,7 +823,10 @@ fn age(t: &mut Task, now: u64) {
 /// report and was refused, and the work was discarded. Nothing ever cancelled
 /// that agent, so the wall clock alone decided the result was worthless.
 fn accepts_result(status: &str) -> bool {
-    matches!(status, "pending" | "overdue")
+    // "rework" is here because a rejected review has to be answerable. Without
+    // it the implementer is told what is wrong and given no way to say it is
+    // fixed, so the review round trip dead-ends on its first rejection.
+    matches!(status, "pending" | "overdue" | "rework")
 }
 
 /// The core of `finish_task`: flip a task to "done" if it is still awaiting a
@@ -790,11 +851,101 @@ fn finish_pending(
         // resurrect, and a completed one should not be silently rewritten.
         Some(t) if !accepts_result(&t.status) => Err(TaskAccessError::NotPending),
         Some(t) => {
-            t.status = "done".to_string();
             t.result = result.to_string();
+            // The gate. Work with a named reviewer is not finished when the
+            // agent that did it says so, which was the previous contract and
+            // the reason "done" meant "self-certified".
+            t.status = if t.reviewer.is_empty() {
+                "done".to_string()
+            } else {
+                "in_review".to_string()
+            };
             Ok(())
         }
         None => Err(TaskAccessError::NotFound),
+    }
+}
+
+/// Sign off on a task, or send it back. The other half of the gate.
+///
+/// Separate from `finish_pending` because the callers are different sessions
+/// with different rights: the target may submit work, and only the named
+/// reviewer may decide whether it counts.
+fn review_pending(
+    tasks: &mut [Task],
+    caller: &str,
+    id: &str,
+    approved: bool,
+    findings: &str,
+) -> Result<(), TaskAccessError> {
+    match tasks.iter_mut().find(|t| t.id == id) {
+        // Only the named reviewer. Not the implementer, who would be
+        // self-certifying by another route, and not a bystander.
+        Some(t) if t.reviewer != caller => Err(TaskAccessError::Forbidden),
+        Some(t) if t.status != "in_review" => Err(TaskAccessError::NotPending),
+        Some(t) => {
+            t.findings = findings.to_string();
+            // Rejection returns it to the implementer rather than killing it.
+            // The result stays: the reviewer is judging a specific submission
+            // and discarding it would lose what they were judging.
+            t.status = if approved { "done" } else { "rework" }.to_string();
+            Ok(())
+        }
+        None => Err(TaskAccessError::NotFound),
+    }
+}
+
+/// What a conductor passes as `reviewer` to skip review deliberately.
+///
+/// A word rather than an empty string, because the two must not be the same
+/// thing. Omitting the field is a conductor that did not think about review;
+/// this is one that did and decided against it.
+pub const REVIEW_WAIVED: &str = "none";
+
+/// Who reviews this task: the empty string when nobody does.
+///
+/// **Omitting a reviewer requests one rather than skipping one.** That default
+/// is the entire enforcement mechanism. An opt-in gate is skipped by the
+/// conductor who forgets, which is precisely the failure being fixed, so
+/// forgetting has to produce a review rather than the absence of one.
+///
+/// A third party is preferred over the dispatcher, on the grounds that whoever
+/// wrote the brief is the reader least likely to notice it was misread. The
+/// dispatcher is still a fine reviewer, and is the intended case for a
+/// conductor checking work from a different model.
+fn choose_reviewer(
+    requested: &str,
+    from: &str,
+    target: &str,
+    live: &[String],
+) -> Result<String, String> {
+    if requested == REVIEW_WAIVED {
+        return Ok(String::new());
+    }
+
+    if !requested.is_empty() {
+        if requested == target {
+            return Err(format!(
+                "'{requested}' cannot review its own work. Name a different session, \
+                 or pass reviewer '{REVIEW_WAIVED}' to skip review for this task."
+            ));
+        }
+        if !live.iter().any(|s| s == requested) {
+            return Err(format!(
+                "no live session '{requested}' to review this. Call list_sessions for \
+                 valid reviewers."
+            ));
+        }
+        return Ok(requested.to_string());
+    }
+
+    let third_party = live.iter().find(|s| *s != target && *s != from);
+    let dispatcher = live.iter().find(|s| *s != target && *s == from);
+    match third_party.or(dispatcher) {
+        Some(reviewer) => Ok(reviewer.clone()),
+        // A workspace with nobody else in it. Refusing the dispatch would make
+        // a solo pane unusable, so this waives and the caller says so out loud.
+        None => Ok(String::new()),
     }
 }
 
@@ -847,10 +998,32 @@ fn mark_pending_error(tasks: &mut [Task], id: &str) -> bool {
 /// One task rendered for an agent. Kept in one place so a single-id lookup and
 /// the collect-everything listing never drift apart.
 fn render_task(t: &Task) -> String {
-    if t.status == "done" {
-        format!("[done] {} → {}\n{}", t.target, t.task, t.result)
+    // Who signed off is part of the answer, not a footnote. A conductor
+    // reading "done" needs to know whether that means reviewed or waived,
+    // because the two carry very different confidence.
+    let sign_off = match (t.status.as_str(), t.reviewer.as_str()) {
+        ("done", "") => " (no review was required)".to_string(),
+        ("done", r) => format!(" (reviewed by {r})"),
+        ("in_review", r) => format!(" (awaiting review by {r})"),
+        ("rework", r) => format!(" (sent back by {r})"),
+        _ => String::new(),
+    };
+
+    // Findings matter most on rejection and are still worth showing on
+    // approval: an approval with caveats is not an unqualified one.
+    let findings = if t.findings.is_empty() {
+        String::new()
     } else {
-        format!("[{}] {} → {}", t.status, t.target, t.task)
+        format!("\n--- review by {} ---\n{}", t.reviewer, t.findings)
+    };
+
+    if t.result.is_empty() {
+        format!("[{}]{} {} → {}", t.status, sign_off, t.target, t.task)
+    } else {
+        format!(
+            "[{}]{} {} → {}\n{}{}",
+            t.status, sign_off, t.target, t.task, t.result, findings
+        )
     }
 }
 
@@ -862,7 +1035,10 @@ const RECENT_FINISHED: usize = 10;
 
 fn is_open(status: &str) -> bool {
     // "overdue" is explicitly still running, so it belongs with pending.
-    status == "pending" || status == "overdue"
+    // "in_review" and "rework" are open for a different reason: the work is
+    // submitted but unsigned. Counting either as finished would hide exactly
+    // the debt this gate exists to surface.
+    matches!(status, "pending" | "overdue" | "in_review" | "rework")
 }
 
 fn truncate_chars(s: &str, limit: usize) -> String {
@@ -1020,6 +1196,23 @@ pub struct DispatchArgs {
     pub target: String,
     /// The task, written the way you'd say it to a teammate.
     pub task: String,
+    /// Session that must approve the result before it counts as done. Use a
+    /// different model from the target where you can: that is the whole value.
+    /// You may name yourself. Leave empty only to waive review deliberately.
+    #[serde(default)]
+    pub reviewer: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReviewArgs {
+    /// The task_id you were asked to review.
+    pub task_id: String,
+    /// True to sign it off, false to send it back for rework.
+    pub approved: bool,
+    /// What you found. Required on rejection and worth writing on approval:
+    /// an approval with caveats is not an unqualified one.
+    #[serde(default)]
+    pub findings: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1190,7 +1383,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id — it does NOT block — so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id — it does NOT block — so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -1210,10 +1403,14 @@ impl BrainHandler {
             }
         }
 
-        match self.shared.dispatch_task(&me, &p.target, &p.task) {
+        match self.shared.dispatch_task(&me, &p.target, &p.task, &p.reviewer) {
             Err(e) => format!("Refused: {e}"),
+            Ok(o) if o.delivered && !o.reviewer.is_empty() => format!(
+                "Dispatched to {} as task {}. {} will review it before it counts as done, so                  expect status 'in_review' before 'done'. Poll get_task_result with that id.",
+                p.target, o.task_id, o.reviewer
+            ),
             Ok(o) if o.delivered => format!(
-                "Dispatched to {} as task {}. Poll get_task_result with that id.",
+                "Dispatched to {} as task {} with NO review: nobody else is live to check it.                  Poll get_task_result with that id.",
                 p.target, o.task_id
             ),
             Ok(o) => format!(
@@ -1223,13 +1420,19 @@ impl BrainHandler {
         }
     }
 
-    #[tool(description = "Report the result of a task the conductor dispatched to you.")]
+    #[tool(
+        description = "Report the result of a task the conductor dispatched to you. If the task has a reviewer, this submits your work for review rather than finishing it: expect status in_review, and if it comes back as rework, fix what the findings raise and call this again."
+    )]
     fn complete_task(&self, Parameters(p): Parameters<CompleteArgs>) -> String {
         match self
             .shared
             .finish_task(&self.author(), &p.task_id, &p.result)
         {
-            Ok(()) => "Result recorded — the conductor can now read it.".to_string(),
+            Ok(t) if t.status == "in_review" => format!(
+                "Result recorded and sent to {} for review. It is NOT done yet: if they send                  it back the status becomes 'rework' and you should fix what they raise and                  call complete_task again.",
+                t.reviewer
+            ),
+            Ok(_) => "Result recorded — the conductor can now read it.".to_string(),
             Err(TaskAccessError::Forbidden) => {
                 "Refused: this task is assigned to a different session.".to_string()
             }
@@ -1242,7 +1445,38 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once — do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it."
+        description = "Sign off on a task you were named to review, or send it back. Only the named reviewer can call this, and only while the task is in_review. Approving marks it done; rejecting sets it to 'rework' and returns it to the agent that did the work, which can fix your findings and resubmit. Read the work before deciding: an approval you did not earn is worse than no review, because it looks like one."
+    )]
+    fn review_task(&self, Parameters(p): Parameters<ReviewArgs>) -> String {
+        if !p.approved && p.findings.trim().is_empty() {
+            return "Refused: a rejection needs findings. Say what is wrong, or the agent                     doing the rework is guessing."
+                .to_string();
+        }
+        match self
+            .shared
+            .review_task(&self.author(), &p.task_id, p.approved, &p.findings)
+        {
+            Ok(t) if p.approved => format!(
+                "Approved task '{}'. It is now done and {} can read your findings.",
+                p.task_id, t.from
+            ),
+            Ok(t) => format!(
+                "Sent task '{}' back to {} as 'rework' with your findings.",
+                p.task_id, t.target
+            ),
+            Err(TaskAccessError::Forbidden) => {
+                "Refused: you are not the reviewer named for this task.".to_string()
+            }
+            Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
+            Err(TaskAccessError::NotPending) => format!(
+                "Task '{}' is not awaiting review, so there is nothing to sign off.",
+                p.task_id
+            ),
+        }
+    }
+
+    #[tool(
+        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once — do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -1306,12 +1540,12 @@ impl BrainHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        age, append_record, bearer_matches, busy_label, conductor_briefing, dispatch_precheck,
-        dispatch_prompt, finish_pending, human_ms, injection_overage, load_brain,
-        mark_pending_error, mint_session_token, oversize_refusal, render_task, render_task_summary,
-        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry, Notifier,
-        Shared, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS,
-        TASK_OVERDUE_MS,
+        age, append_record, bearer_matches, busy_label, choose_reviewer, conductor_briefing,
+        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, injection_overage, is_open,
+        load_brain, mark_pending_error, mint_session_token, oversize_refusal, render_task,
+        render_task_summary, review_pending, select_tasks, task_for_dispatcher,
+        validate_path_component, AgentSession, Entry, Notifier, Shared, StoreRecord, Task,
+        TaskAccessError, RECENT_FINISHED, REVIEW_WAIVED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1353,6 +1587,8 @@ mod tests {
             status: status.into(),
             result: String::new(),
             ts_ms,
+            reviewer: String::new(),
+            findings: String::new(),
         }
     }
 
@@ -1515,7 +1751,7 @@ mod tests {
         let (shared, _dir) = shared_for_test();
 
         let err = shared
-            .dispatch_task("sess-1", "sess-2", "audit the parser")
+            .dispatch_task("sess-1", "sess-2", "audit the parser", "")
             .expect_err("no session is live in this fixture");
         assert!(err.contains("no live session"), "{err}");
 
@@ -1616,6 +1852,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         };
         assert!(render_task(&base).starts_with("[pending]"));
 
@@ -1638,6 +1876,8 @@ mod tests {
             task: "audit the parser".into(),
             status: "error".into(),
             result: String::new(),
+            reviewer: String::new(),
+            findings: String::new(),
             ts_ms: 0,
         };
         assert!(render_task(&base).starts_with("[error]"));
@@ -1681,6 +1921,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         }];
         assert_eq!(
             finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs"),
@@ -1709,6 +1951,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         }];
 
         assert_eq!(
@@ -1729,6 +1973,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         }];
 
         assert_eq!(
@@ -1804,6 +2050,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         }];
         assert!(mark_pending_error(&mut tasks, "abc123"));
         assert_eq!(tasks[0].status, "error");
@@ -1821,6 +2069,8 @@ mod tests {
             task: "t".into(),
             status: "cancelled".into(),
             result: String::new(),
+            reviewer: String::new(),
+            findings: String::new(),
             ts_ms: 0,
         }];
         assert!(!mark_pending_error(&mut tasks, "abc123"));
@@ -1837,6 +2087,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         };
 
         let mut pending = base.clone();
@@ -1865,6 +2117,8 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
         }];
 
         age(&mut tasks[0], TASK_OVERDUE_MS + 1);
@@ -1890,6 +2144,8 @@ mod tests {
                 task: "t".into(),
                 status: status.into(),
                 result: "original".into(),
+                reviewer: String::new(),
+                findings: String::new(),
                 ts_ms: 0,
             }];
             assert_eq!(
@@ -1911,6 +2167,8 @@ mod tests {
             task: "t".into(),
             status: "overdue".into(),
             result: String::new(),
+            reviewer: String::new(),
+            findings: String::new(),
             ts_ms: 0,
         }];
         assert_eq!(
@@ -1943,6 +2201,8 @@ mod tests {
             task: "test persistence".into(),
             status: "pending".into(),
             result: String::new(),
+            reviewer: String::new(),
+            findings: String::new(),
             ts_ms: 2,
         };
         let done = Task {
@@ -1960,6 +2220,299 @@ mod tests {
         assert_eq!(loaded.entries, vec![entry]);
         assert_eq!(loaded.sessions, vec![session]);
         assert_eq!(loaded.tasks, vec![done]);
+    }
+
+    // -----------------------------------------------------------------
+    // The review gate: work is not done because the agent that did it says so
+    // -----------------------------------------------------------------
+
+    fn reviewed_task(status: &str) -> Task {
+        Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: status.into(),
+            result: String::new(),
+            ts_ms: 0,
+            reviewer: "sess-3".into(),
+            findings: String::new(),
+        }
+    }
+
+    #[test]
+    fn submitting_work_with_a_reviewer_does_not_finish_it() {
+        // The entire point. Before this, complete_task wrote "done" and the
+        // task's life ended there, so "done" meant "self-certified".
+        let mut tasks = vec![reviewed_task("pending")];
+
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs"),
+            Ok(())
+        );
+
+        assert_eq!(tasks[0].status, "in_review");
+        assert_eq!(tasks[0].result, "found two bugs", "the work itself is kept");
+    }
+
+    #[test]
+    fn submitting_work_with_no_reviewer_still_finishes_it() {
+        // The waiver, and it has to stay cheap. A gate that makes a typo fix
+        // cost a round trip gets routed around rather than followed.
+        let mut tasks = vec![Task {
+            reviewer: String::new(),
+            ..reviewed_task("pending")
+        }];
+
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "abc123", "fixed"),
+            Ok(())
+        );
+
+        assert_eq!(tasks[0].status, "done");
+    }
+
+    #[test]
+    fn only_the_named_reviewer_may_sign_off() {
+        // Including, and especially, the agent that did the work: approving
+        // your own submission is the self-certification this replaces, just
+        // reached by a different call.
+        let mut tasks = vec![reviewed_task("in_review")];
+
+        assert_eq!(
+            review_pending(&mut tasks, "sess-2", "abc123", true, "looks fine to me"),
+            Err(TaskAccessError::Forbidden),
+            "the implementer must not be able to approve its own work"
+        );
+        assert_eq!(
+            review_pending(&mut tasks, "sess-4", "abc123", true, "sure"),
+            Err(TaskAccessError::Forbidden),
+            "a bystander must not be able to approve it either"
+        );
+
+        assert_eq!(
+            tasks[0].status, "in_review",
+            "neither attempt changed anything"
+        );
+    }
+
+    #[test]
+    fn approval_finishes_the_task_and_keeps_what_the_reviewer_said() {
+        let mut tasks = vec![reviewed_task("in_review")];
+
+        assert_eq!(
+            review_pending(
+                &mut tasks,
+                "sess-3",
+                "abc123",
+                true,
+                "correct, one nit accepted"
+            ),
+            Ok(())
+        );
+
+        assert_eq!(tasks[0].status, "done");
+        // An approval with caveats is not an unqualified one, so the caveats
+        // survive rather than being thrown away on the happy path.
+        assert_eq!(tasks[0].findings, "correct, one nit accepted");
+    }
+
+    #[test]
+    fn rejection_returns_the_work_and_the_implementer_can_answer_it() {
+        // The round trip has to close. A rejection that leaves the task in a
+        // state nobody can act on is a dead end wearing the word "review".
+        let mut tasks = vec![reviewed_task("in_review")];
+        tasks[0].result = "first attempt".into();
+
+        assert_eq!(
+            review_pending(
+                &mut tasks,
+                "sess-3",
+                "abc123",
+                false,
+                "the ordering claim is untested"
+            ),
+            Ok(())
+        );
+        assert_eq!(tasks[0].status, "rework");
+        assert_eq!(tasks[0].findings, "the ordering claim is untested");
+        assert_eq!(
+            tasks[0].result, "first attempt",
+            "the reviewer judged a specific submission; discarding it loses what was judged"
+        );
+
+        // And back round again.
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "abc123", "second attempt, test added"),
+            Ok(())
+        );
+        assert_eq!(
+            tasks[0].status, "in_review",
+            "a fix goes back to the same reviewer"
+        );
+        assert_eq!(tasks[0].result, "second attempt, test added");
+    }
+
+    #[test]
+    fn a_task_can_only_be_reviewed_once_and_only_when_submitted() {
+        let mut tasks = vec![reviewed_task("pending")];
+        assert_eq!(
+            review_pending(&mut tasks, "sess-3", "abc123", true, ""),
+            Err(TaskAccessError::NotPending),
+            "nothing has been submitted yet, so there is nothing to sign off"
+        );
+
+        tasks[0].status = "in_review".into();
+        assert_eq!(
+            review_pending(&mut tasks, "sess-3", "abc123", true, "ok"),
+            Ok(())
+        );
+        assert_eq!(
+            review_pending(&mut tasks, "sess-3", "abc123", false, "changed my mind"),
+            Err(TaskAccessError::NotPending),
+            "a signed-off task must not be reopened by a second review"
+        );
+        assert_eq!(tasks[0].status, "done");
+    }
+
+    #[test]
+    fn omitting_a_reviewer_requests_one_rather_than_skipping_one() {
+        // The load-bearing default, and the reason this is a gate rather than
+        // a suggestion. An opt-in review is skipped by the conductor who
+        // forgets, which is the exact failure being fixed here.
+        let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
+
+        assert_eq!(
+            choose_reviewer("", "sess-1", "sess-2", &live),
+            Ok("sess-3".to_string()),
+            "a third party is preferred over the conductor who wrote the brief"
+        );
+    }
+
+    #[test]
+    fn the_dispatcher_reviews_when_it_is_the_only_one_left() {
+        // Two panes and the conductor is one of them. This is the case the
+        // feature was asked for: one model checking another model's work.
+        let live = vec!["sess-1".to_string(), "sess-2".into()];
+
+        assert_eq!(
+            choose_reviewer("", "sess-1", "sess-2", &live),
+            Ok("sess-1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_solo_workspace_waives_rather_than_refusing_the_dispatch() {
+        // Nobody else is here. Refusing would make a single-pane workspace
+        // unusable, so this waives, and dispatch says so out loud rather than
+        // letting the conductor assume a review happened.
+        let live = vec!["sess-2".to_string()];
+
+        assert_eq!(
+            choose_reviewer("", "sess-2", "sess-2", &live),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
+    fn skipping_review_takes_a_word_not_an_omission() {
+        let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
+
+        assert_eq!(
+            choose_reviewer(REVIEW_WAIVED, "sess-1", "sess-2", &live),
+            Ok(String::new()),
+            "an explicit waiver is honoured"
+        );
+        assert_ne!(
+            choose_reviewer("", "sess-1", "sess-2", &live),
+            Ok(String::new()),
+            "but silence is not a waiver"
+        );
+    }
+
+    #[test]
+    fn a_named_reviewer_must_be_someone_other_than_the_worker_and_must_exist() {
+        let live = vec!["sess-1".to_string(), "sess-2".into(), "sess-3".into()];
+
+        assert_eq!(
+            choose_reviewer("sess-3", "sess-1", "sess-2", &live),
+            Ok("sess-3".to_string())
+        );
+        // The conductor reviewing is explicitly fine.
+        assert_eq!(
+            choose_reviewer("sess-1", "sess-1", "sess-2", &live),
+            Ok("sess-1".to_string())
+        );
+
+        let self_review = choose_reviewer("sess-2", "sess-1", "sess-2", &live).unwrap_err();
+        assert!(
+            self_review.contains("cannot review its own work"),
+            "{self_review}"
+        );
+        // And it names the escape hatch, or the conductor is stuck guessing.
+        assert!(self_review.contains(REVIEW_WAIVED), "{self_review}");
+
+        let dead = choose_reviewer("sess-9", "sess-1", "sess-2", &live).unwrap_err();
+        assert!(dead.contains("no live session 'sess-9'"), "{dead}");
+    }
+
+    #[test]
+    fn unsigned_work_still_counts_as_open() {
+        // Otherwise the listing that answers "what am I waiting on" hides
+        // exactly the debt this gate exists to surface.
+        assert!(is_open("in_review"));
+        assert!(is_open("rework"));
+        assert!(!is_open("done"));
+    }
+
+    #[test]
+    fn a_reader_can_tell_reviewed_work_from_unreviewed_work() {
+        // "done" alone cannot be trusted, so it never appears alone.
+        let mut approved = reviewed_task("done");
+        approved.result = "found two bugs".into();
+        approved.findings = "verified both".into();
+        let text = render_task(&approved);
+        assert!(text.contains("reviewed by sess-3"), "{text}");
+        assert!(text.contains("verified both"), "{text}");
+
+        let waived = Task {
+            reviewer: String::new(),
+            result: "fixed".into(),
+            ..reviewed_task("done")
+        };
+        assert!(
+            render_task(&waived).contains("no review was required"),
+            "a waived task must not read the same as a reviewed one"
+        );
+
+        assert!(render_task(&reviewed_task("in_review")).contains("awaiting review by sess-3"));
+        assert!(render_task(&reviewed_task("rework")).contains("sent back by sess-3"));
+    }
+
+    #[test]
+    fn tasks_written_before_the_gate_existed_still_load() {
+        // brain.jsonl is append-only and predates these fields. A schema
+        // change that silently drops a workspace's history is not a feature.
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let mut file = std::fs::File::create(dir.join(super::STORE_FILE)).unwrap();
+        let legacy = concat!(
+            r#"{"type":"task","value":{"id":"old1","from":"sess-1","target":"sess-2","#,
+            r#""task":"audit","status":"done","result":"did it","ts_ms":1}}"#,
+            "\n"
+        );
+        file.write_all(legacy.as_bytes()).unwrap();
+
+        let loaded = load_brain(&dir);
+
+        assert_eq!(loaded.tasks.len(), 1, "an old task must not be discarded");
+        assert_eq!(loaded.tasks[0].result, "did it");
+        assert_eq!(
+            loaded.tasks[0].reviewer, "",
+            "a legacy task reads as review-waived, not as reviewed by nobody"
+        );
     }
 
     #[test]

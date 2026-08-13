@@ -1121,7 +1121,11 @@ fn human_dispatch(
         None => return Err(format!("no live session '{target}'.")),
     }
 
-    shared.dispatch_task(&from, &target, &task)
+    // No reviewer: this is a human typing into the UI, and a human dispatching
+    // work directly is already the second pair of eyes the gate exists to
+    // provide. Give this a reviewer field when the UI grows somewhere to pick
+    // one, rather than guessing a session on the user's behalf.
+    shared.dispatch_task(&from, &target, &task, "")
 }
 
 #[cfg(test)]
