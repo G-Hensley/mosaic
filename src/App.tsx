@@ -21,8 +21,11 @@ import {
   haltConductor,
   setProject as setProjectDir,
   dispatchTask,
+  type SavedWorktree,
   type SessionType,
+  type SessionWorktreeEvent,
 } from "./lib/ipc";
+import { loadRoster, saveRoster, seedCounter } from "./lib/panes";
 import { brainColorMap } from "./lib/brains";
 import "./App.css";
 
@@ -33,10 +36,25 @@ type Pane = {
   status: PaneStatus;
   brain: string;
   isolate: boolean;
+  // Where an isolated pane's worktree is, once the backend reports it. Persisted
+  // so the pane can be put back into that same worktree after a restart.
+  worktree?: SavedWorktree;
 };
 
 function App() {
-  const [panes, setPanes] = useState<Pane[]>([]);
+  // The panes that were open when the app was last closed. Read once, before the
+  // first render, so the CLIs come back with the window instead of after it.
+  const [roster] = useState(loadRoster);
+  // A restored pane is spawned fresh, so it starts "running" whatever it was
+  // doing last time; the spawn corrects it if the CLI never comes up.
+  const [panes, setPanes] = useState<Pane[]>(() =>
+    roster.panes.map((p) => ({ ...p, status: "running" as const })),
+  );
+  // Restores that did not work out — a session type that no longer exists, a CLI
+  // that would not start, a worktree that cannot be reused. Shown once, together,
+  // so one bad pane is a message rather than a silently missing agent.
+  const [restoreProblems, setRestoreProblems] = useState<string[]>(() => roster.problems);
+  const restoredIds = useRef(new Set(roster.panes.map((p) => p.id)));
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [layoutOpen, setLayoutOpen] = useState(false);
@@ -82,8 +100,63 @@ function App() {
   const [conductorHalted, setConductorHalted] = useState(false);
   const [dispatchOpen, setDispatchOpen] = useState(false);
   const [toasts, setToasts] = useState<string[]>([]); // dismissed task ids
-  const counter = useRef(0);
+  // Past the highest restored id: restored panes keep the ids they had, and a
+  // counter starting from zero would hand a new session an id that is already
+  // live, which the backend refuses.
+  const counter = useRef(seedCounter(roster.panes.map((p) => p.id)));
   const dragId = useRef<string | null>(null);
+
+  // Put each restored pane's agent back in the brain it belonged to. The panes
+  // themselves are already in state (and spawning); this is the half of
+  // `addSession` that lives outside the pane list.
+  useEffect(() => {
+    for (const pane of roster.panes) {
+      setAgentBrain(pane.id, pane.brain).catch(() => {});
+    }
+    // Runs once, against the roster captured before the first render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Remember the roster on every change, so a restart brings back whatever was
+  // open at the moment it happened. Status is deliberately not stored: a
+  // restored pane is a new process, so its state is whatever the new spawn
+  // reports.
+  useEffect(() => {
+    saveRoster(
+      panes.map((p) => ({
+        id: p.id,
+        typeId: p.type.id,
+        brain: p.brain,
+        isolate: p.isolate,
+        worktree: p.worktree,
+      })),
+    );
+  }, [panes]);
+
+  // The backend reports which worktree an isolated session actually got, once it
+  // is live. Recording it is what lets the next launch return the pane to that
+  // worktree instead of stranding it — an abandoned worktree can hold
+  // uncommitted agent work that nothing in the app would point at any more.
+  useEffect(() => {
+    const unlisten = listen<SessionWorktreeEvent>("session-worktree", (ev) => {
+      const { sessionId, ...worktree } = ev.payload;
+      setPanes((p) => p.map((x) => (x.id === sessionId ? { ...x, worktree } : x)));
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // A pane that never started. Only reported for restored panes: a session the
+  // user just launched by hand has their attention already, and the failure is
+  // printed in its terminal either way.
+  function noteSpawnFailure(id: string, message: string) {
+    if (!restoredIds.current.has(id)) return;
+    setRestoreProblems((problems) => {
+      const note = `Could not restore ${id}: ${message}`;
+      return problems.includes(note) ? problems : [...problems, note];
+    });
+  }
 
   useEffect(() => {
     let alive = true;
@@ -326,6 +399,16 @@ function App() {
         </button>
       </header>
 
+      {restoreProblems.length > 0 && (
+        <div className="restore-problem" role="status">
+          <span>{restoreProblems.join(" · ")}</span>
+          <div className="spacer" />
+          <button className="ghost" onClick={() => setRestoreProblems([])}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {conductor && (
         <ConductorBar
           conductor={conductor}
@@ -446,7 +529,9 @@ function App() {
                     type={p.type}
                     isolate={p.isolate}
                     cwd={project ?? undefined}
+                    reuseWorktree={p.worktree}
                     onExit={markExited}
+                    onSpawnError={noteSpawnFailure}
                   />
                 </section>
               );

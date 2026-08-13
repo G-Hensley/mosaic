@@ -10,6 +10,7 @@ import {
   resizeSession,
   spawnSession,
   type Bytes,
+  type SavedWorktree,
   type SessionType,
 } from "../lib/ipc";
 import { TERM_FONT } from "../lib/themes";
@@ -42,13 +43,23 @@ export function TerminalPane({
   type,
   isolate,
   cwd,
+  reuseWorktree,
   onExit,
+  onSpawnError,
 }: {
   sessionId: string;
   type: SessionType;
   isolate?: boolean;
   cwd?: string;
+  // The worktree this session ran in before the app was last closed. Passed
+  // through so a restored isolated pane rejoins its own worktree rather than
+  // abandoning it and cutting a second one.
+  reuseWorktree?: SavedWorktree;
   onExit: (id: string) => void;
+  // A spawn that never started. The pane shows the reason itself; this lets the
+  // app say so somewhere the user is looking, which matters most on startup
+  // when several panes come back at once.
+  onSpawnError?: (id: string, message: string) => void;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -182,7 +193,12 @@ export function TerminalPane({
     spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
       isolate,
       cwd,
-    }).catch((e) => writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${spawnErrorText(e)}\x1b[0m\r\n`));
+      reuseWorktree,
+    }).catch((e) => {
+      const message = spawnErrorText(e);
+      writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);
+      onSpawnError?.(sessionId, message);
+    });
 
     const unlisten = listen<string>("session-exited", (ev) => {
       if (ev.payload === sessionId) {

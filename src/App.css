@@ -127,6 +127,20 @@ button.ghost.on {
   color: var(--acc);
 }
 
+/* ---- Restore notice ---- */
+/* Sessions come back on their own; this strip only appears when one could not,
+   so the user is told rather than left to notice a missing agent. */
+.restore-problem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--txt);
+  background: var(--panel2);
+  border-bottom: 1px solid var(--danger);
+}
+
 /* ---- Body: grid + sidebar ---- */
 .body {
   flex: 1;

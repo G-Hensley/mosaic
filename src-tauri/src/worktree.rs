@@ -17,6 +17,39 @@ pub struct Worktree {
     pub base: String,
 }
 
+/// A worktree a previous run of the app created, as the frontend remembered it.
+///
+/// Persisted per pane so a restored session can go back to the worktree it was
+/// already working in. Only what is needed to identify and re-adopt it is kept;
+/// everything else about a `Worktree` is re-derived on reattach.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Saved {
+    pub repo: String,
+    pub path: String,
+    pub branch: String,
+    /// Commit the branch started from, carried forward so `remove` can still
+    /// tell whether the agent committed anything of its own.
+    pub base: String,
+}
+
+/// Outcome of trying to re-adopt a `Saved` worktree.
+///
+/// The distinction that matters is `Missing` versus `Unusable`: only the former
+/// means a fresh worktree can safely be cut. See `reattach`.
+pub enum Reattach {
+    /// The worktree is still on disk and registered — the session goes back into it.
+    Reused(Worktree),
+    /// The directory is gone, so there is nothing left to strand.
+    Missing,
+    /// It belongs to a different repository than the one now in play (the user
+    /// switched projects), so it is not this session's to re-adopt — and it is
+    /// still tracked by its own repo, so ignoring it strands nothing.
+    Foreign,
+    /// The directory is still on disk but git cannot use it as a worktree of this
+    /// repo. Carries why, for the message the user gets.
+    Unusable(String),
+}
+
 /// Outcome of attempting to remove a worktree.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RemoveOutcome {
@@ -106,6 +139,88 @@ pub(crate) fn create_with_base_dir(
 /// unique suffix so re-used session ids across app runs never collide.
 pub fn create(repo: &Path, session_id: &str) -> Result<Worktree, String> {
     create_with_base_dir(repo, session_id, &base_dir())
+}
+
+/// Compare two paths for "same directory on disk".
+///
+/// String equality is not enough: the path git prints in `worktree list` and the
+/// one the frontend persisted can differ in separator and (on Windows) case
+/// while naming the same directory, and treating them as different is the
+/// dangerous direction — it reads as "the old worktree is gone" and cuts a
+/// second one. Canonicalize when both sides resolve; fall back to a normalized
+/// textual compare when either does not.
+fn same_path(a: &Path, b: &Path) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.trim().trim_start_matches("\\\\?\\").replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => norm(&a.to_string_lossy()) == norm(&b.to_string_lossy()),
+        _ => norm(&a.to_string_lossy()) == norm(&b.to_string_lossy()),
+    }
+}
+
+/// Re-adopt the worktree a session was already running in, instead of cutting a
+/// second one and abandoning the first.
+///
+/// This exists because an abandoned worktree is not merely untidy: it can hold
+/// an agent's uncommitted work, which is exactly why `remove` refuses to delete
+/// a dirty one. A worktree with no session pointing at it is work nothing in the
+/// app can lead the user back to. So a directory that is still on disk is never
+/// written off — `Unusable` is reported instead of `Missing`, and the caller
+/// refuses the spawn rather than stranding it.
+///
+/// Registration with `repo` is the authority for "still a worktree", not the
+/// mere existence of the directory: a pruned or moved-away entry leaves a
+/// directory git will not accept commands for.
+pub fn reattach(repo: &Path, saved: &Saved) -> Reattach {
+    if !same_path(Path::new(&saved.repo), repo) {
+        return Reattach::Foreign;
+    }
+    let path = PathBuf::from(&saved.path);
+    if !path.exists() {
+        return Reattach::Missing;
+    }
+
+    let repo_s = repo.to_string_lossy().to_string();
+    let listed = match git_out(&["-C", &repo_s, "worktree", "list", "--porcelain"]) {
+        Ok(out) => out,
+        Err(e) => {
+            return Reattach::Unusable(format!("git could not list this repo's worktrees: {e}"))
+        }
+    };
+    let registered = listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .any(|listed| same_path(Path::new(listed.trim()), &path));
+    if !registered {
+        return Reattach::Unusable(
+            "it is no longer registered as a worktree of this repository".to_string(),
+        );
+    }
+
+    // Read the branch back from the worktree rather than trusting the saved
+    // name: the agent may have switched branches during the last run, and
+    // `remove` decides whether a branch is safe to delete from this value.
+    let path_s = path.to_string_lossy().to_string();
+    let branch = match git_out(&["-C", &path_s, "rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(b) if !b.is_empty() && b != "HEAD" => b,
+        // Detached HEAD — keep the recorded name so the branch is still tracked.
+        Ok(_) => saved.branch.clone(),
+        Err(e) => return Reattach::Unusable(format!("git cannot run inside it: {e}")),
+    };
+
+    Reattach::Reused(Worktree {
+        repo: repo.to_path_buf(),
+        path,
+        branch,
+        base: saved.base.clone(),
+    })
 }
 
 /// Remove the worktree. The branch is deleted ONLY if it has no commits of its
@@ -295,6 +410,116 @@ mod tests {
         // remove() should succeed and not error
         let result = remove(&wt).unwrap();
         assert_eq!(result, RemoveOutcome::AlreadyGone);
+    }
+
+    /// What the frontend persists for an isolated pane.
+    fn saved_from(wt: &Worktree) -> Saved {
+        Saved {
+            repo: wt.repo.to_string_lossy().to_string(),
+            path: wt.path.to_string_lossy().to_string(),
+            branch: wt.branch.clone(),
+            base: wt.base.clone(),
+        }
+    }
+
+    #[test]
+    fn reattach_reuses_a_worktree_that_is_still_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo).unwrap();
+
+        let wt = create_test_wt(&repo, "sess-restore", &tmp);
+        let saved = saved_from(&wt);
+
+        match reattach(&repo, &saved) {
+            Reattach::Reused(w) => {
+                assert_eq!(w.path, wt.path, "must go back to the same directory");
+                assert_eq!(w.branch, wt.branch);
+                assert_eq!(w.base, wt.base, "base must survive so remove() still works");
+            }
+            _ => panic!("an intact worktree must be reused"),
+        }
+    }
+
+    /// The trap this whole path exists to avoid: a restored session must land
+    /// back on the uncommitted work, not beside it in a second worktree.
+    #[test]
+    fn reattach_keeps_uncommitted_work_reachable() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo).unwrap();
+
+        let wt = create_test_wt(&repo, "sess-dirty", &tmp);
+        fs::write(wt.path.join("in-progress.txt"), "unsaved").unwrap();
+
+        match reattach(&repo, &saved_from(&wt)) {
+            Reattach::Reused(w) => {
+                assert!(w.path.join("in-progress.txt").exists());
+            }
+            _ => panic!("a dirty worktree must be reused, never abandoned"),
+        }
+    }
+
+    #[test]
+    fn reattach_reports_missing_when_the_directory_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo).unwrap();
+
+        let wt = create_test_wt(&repo, "sess-gone", &tmp);
+        let saved = saved_from(&wt);
+        // The ordinary case: the session exited clean last run and cleanup took it.
+        assert_eq!(remove(&wt).unwrap(), RemoveOutcome::Removed);
+
+        assert!(
+            matches!(reattach(&repo, &saved), Reattach::Missing),
+            "a removed worktree leaves nothing to strand, so a fresh one is fine"
+        );
+    }
+
+    #[test]
+    fn reattach_reports_unusable_when_the_directory_is_no_longer_a_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo).unwrap();
+
+        // A directory that exists but git has no worktree registration for.
+        let orphan = tmp.path().join("orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("work.txt"), "might be the agent's").unwrap();
+        let saved = Saved {
+            repo: repo.to_string_lossy().to_string(),
+            path: orphan.to_string_lossy().to_string(),
+            branch: "mosaic/sess-orphan".to_string(),
+            base: "HEAD".to_string(),
+        };
+
+        assert!(
+            matches!(reattach(&repo, &saved), Reattach::Unusable(_)),
+            "a directory still on disk must never be written off as gone"
+        );
+    }
+
+    #[test]
+    fn reattach_reports_foreign_when_the_project_changed() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        init_repo(&repo).unwrap();
+        init_repo(&other).unwrap();
+
+        let wt = create_test_wt(&repo, "sess-moved", &tmp);
+
+        assert!(
+            matches!(reattach(&other, &saved_from(&wt)), Reattach::Foreign),
+            "another repo's worktree is not this session's to adopt"
+        );
     }
 
     #[test]

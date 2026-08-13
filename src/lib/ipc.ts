@@ -30,6 +30,19 @@ export const SESSION_TYPES: SessionType[] = [
   { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a" },
 ];
 
+// The git worktree an isolated session runs in. Reported by the backend once the
+// session is live (the `session-worktree` event) and handed back on the next
+// launch so a restored pane returns to the worktree it was already working in
+// instead of stranding it — see `choose_worktree` in the backend.
+export type SavedWorktree = {
+  repo: string;
+  path: string;
+  branch: string;
+  base: string;
+};
+
+export type SessionWorktreeEvent = SavedWorktree & { sessionId: string };
+
 export function spawnSession(
   sessionId: string,
   channel: Channel<Bytes>,
@@ -37,7 +50,7 @@ export function spawnSession(
   args: string[],
   rows: number,
   cols: number,
-  opts?: { cwd?: string; isolate?: boolean },
+  opts?: { cwd?: string; isolate?: boolean; reuseWorktree?: SavedWorktree },
 ): Promise<void> {
   return invoke("spawn_session", {
     sessionId,
@@ -48,6 +61,7 @@ export function spawnSession(
     cols,
     cwd: opts?.cwd,
     isolate: opts?.isolate,
+    reuseWorktree: opts?.reuseWorktree,
   });
 }
 
