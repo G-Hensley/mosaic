@@ -10,6 +10,7 @@ import {
   resizeSession,
   spawnSession,
   type Bytes,
+  type SavedWorktree,
   type SessionType,
 } from "../lib/ipc";
 import { TERM_FONT } from "../lib/themes";
@@ -46,15 +47,27 @@ export function TerminalPane({
   type,
   isolate,
   cwd,
+  reuseWorktree,
   onExit,
   onIsolationChange,
+  onSpawnError,
 }: {
   sessionId: string;
   type: SessionType;
   isolate?: boolean;
   cwd?: string;
+  // The worktree this session ran in before the app was last closed. Passed
+  // through so a restored isolated pane rejoins its own worktree rather than
+  // abandoning it and cutting a second one.
+  reuseWorktree?: SavedWorktree;
   onExit: (id: string) => void;
+  // Isolation was refused and the user chose to carry on without it, so the
+  // pane's remembered isolation has to change with it.
   onIsolationChange: (id: string, isolate: boolean) => void;
+  // A spawn that never started. The pane shows the reason itself; this lets the
+  // app say so somewhere the user is looking, which matters most on startup
+  // when several panes come back at once.
+  onSpawnError?: (id: string, message: string) => void;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -192,10 +205,15 @@ export function TerminalPane({
       spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
         isolate: withIsolation,
         cwd,
+        // Only an isolated attempt may rejoin the saved worktree. Carrying on
+        // without isolation means there is no worktree to rejoin, and handing
+        // one over anyway would ask the backend for a contradiction.
+        reuseWorktree: withIsolation ? reuseWorktree : undefined,
       }).catch((e) => {
         const message = spawnErrorText(e);
         writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);
         if (isIsolationUnavailable(e)) setIsolationError(message);
+        onSpawnError?.(sessionId, message);
       });
     };
     continueWithoutIsolationRef.current = () => {
