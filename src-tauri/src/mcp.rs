@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::response::IntoResponse;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -247,6 +247,46 @@ const MAX_DISPATCHES: u32 = 40;
 /// threshold most tasks trip is noise, and noise gets ignored.
 const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 
+/// How long `wait_for_tasks` blocks when the caller does not say.
+///
+/// Ten minutes because that is roughly where a dispatched task stops being
+/// slow and starts being suspect: `TASK_OVERDUE_MS` marks it at twenty, and a
+/// default that outlasts that would have the conductor blocked past the point
+/// the workspace already considers the task worth doubting.
+const WAIT_DEFAULT_SECS: u64 = 600;
+
+/// The longest `wait_for_tasks` will block whatever the caller asks for.
+///
+/// A cap rather than an honoured request, because the failure this bounds is
+/// an agent that received its prompt and silently never answers. There is no
+/// signal that distinguishes that from slow work, so the only protection is
+/// refusing to wait forever on either.
+const WAIT_MAX_SECS: u64 = 1800;
+
+/// How often `wait_for_tasks` re-reads task state while blocked.
+///
+/// Two seconds is far below any plausible task duration, so it costs nothing
+/// in latency, and the check is an in-memory scan of a vector the process
+/// already holds.
+const WAIT_POLL_MS: u64 = 2000;
+
+/// How long after the conductor's last dispatch idle panes become worth
+/// mentioning. Short enough to catch a session going solo, long enough that
+/// ordinary back-to-back work does not trip it.
+const NUDGE_AFTER_MS: u64 = 10 * 60 * 1000;
+
+/// How many panes must be idle before it is worth saying so. One idle pane is
+/// a workspace with nothing spare; two is capacity going unused.
+const NUDGE_MIN_IDLE: usize = 2;
+
+/// The quiet period between reminders.
+///
+/// Rate limiting is what keeps this a signal. A line appended to every tool
+/// result becomes part of the wallpaper within a few calls, and a reminder
+/// that is always present carries the same information as one that is never
+/// present.
+const NUDGE_EVERY_MS: u64 = 15 * 60 * 1000;
+
 /// A task record was created and delivery was attempted. `delivered` is false
 /// when the prompt could not be written to the target's terminal — the task
 /// still exists, in "error" status, rather than vanishing silently the way a
@@ -360,6 +400,9 @@ pub struct Shared {
     halted: Mutex<bool>,
     tasks: Mutex<Vec<Task>>,
     dispatches: Mutex<u32>,
+    /// When the conductor was last reminded that panes are sitting idle.
+    /// Zero means never. See `idle_pane_nudge` for why this is rate limited.
+    last_nudge_ms: Mutex<u64>,
 }
 
 impl Shared {
@@ -575,6 +618,67 @@ impl Shared {
 
     pub fn is_halted(&self) -> bool {
         *self.halted.lock().unwrap()
+    }
+
+    /// Live panes with no open task, excluding the caller.
+    ///
+    /// The same "presence is not readiness" rule `roster_lines` applies: a pane
+    /// holding an open task is working even when it has gone quiet, so it is
+    /// not spare capacity. Unlike the roster this returns ids rather than
+    /// formatted lines, because the nudge counts them and names them.
+    fn idle_sessions(&self, excluding: &str) -> Vec<String> {
+        let busy: Vec<String> = {
+            let tasks = self.tasks.lock().unwrap();
+            tasks
+                .iter()
+                .filter(|t| is_open(&t.status))
+                .map(|t| t.target.clone())
+                .collect()
+        };
+        let mut ids = self.engine.ids();
+        ids.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        ids.into_iter()
+            .filter(|id| id != excluding && !busy.contains(id))
+            .collect()
+    }
+
+    /// How long since this agent last dispatched anything. `None` means never.
+    fn ms_since_dispatch_by(&self, from: &str) -> Option<u64> {
+        let tasks = self.tasks.lock().unwrap();
+        let latest = tasks
+            .iter()
+            .filter(|t| t.from == from)
+            .map(|t| t.ts_ms)
+            .max()?;
+        Some(Self::now_ms().saturating_sub(latest))
+    }
+
+    /// The idle-pane reminder for this caller, at most once per quiet period.
+    ///
+    /// Only the conductor is ever nudged: it is the only session that can
+    /// dispatch, so telling anyone else about idle panes is telling them about
+    /// something they cannot act on.
+    ///
+    /// The rate-limit clock is stamped when a reminder is produced, not when
+    /// one is due, so a workspace that sits below the threshold does not build
+    /// up a backlog of reminders to deliver all at once.
+    fn nudge(&self, caller: &str) -> String {
+        if self.conductor().as_deref() != Some(caller) {
+            return String::new();
+        }
+        let Some(text) = idle_pane_nudge(
+            &self.idle_sessions(caller),
+            self.ms_since_dispatch_by(caller),
+        ) else {
+            return String::new();
+        };
+        let now = Self::now_ms();
+        let mut last = self.last_nudge_ms.lock().unwrap();
+        if !nudge_is_due(*last, now) {
+            return String::new();
+        }
+        *last = now;
+        text
     }
 
     pub fn tasks_snapshot(&self) -> Vec<Task> {
@@ -1094,6 +1198,87 @@ fn select_tasks(mine: Vec<Task>, include_all: bool, status: &str) -> (Vec<Task>,
     (out, dropped)
 }
 
+/// Task ids out of one argument.
+///
+/// Commas or whitespace, because a conductor assembling this from six dispatch
+/// replies will separate them however it happens to be writing that sentence,
+/// and refusing one separator would be a refusal it has to guess its way past.
+fn parse_task_ids(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How long to block, clamped.
+///
+/// Zero means "unspecified" rather than "do not wait": `#[serde(default)]`
+/// gives an omitted field zero, and treating that as an instant timeout would
+/// make the common call, `wait_for_tasks` with no arguments, return
+/// immediately and look broken.
+fn wait_timeout(requested_secs: u64) -> Duration {
+    let secs = if requested_secs == 0 {
+        WAIT_DEFAULT_SECS
+    } else {
+        requested_secs.min(WAIT_MAX_SECS)
+    };
+    Duration::from_secs(secs)
+}
+
+/// Which of the wanted ids are still running.
+///
+/// An id with no matching task counts as finished rather than pending. The
+/// caller has already had every id checked for existence and ownership before
+/// the wait starts, so the only way one disappears mid-wait is the brain being
+/// re-pointed at another project, and blocking until the timeout on a task
+/// that no longer exists is the wrong answer to that.
+fn still_open(tasks: &[Task], wanted: &[String]) -> Vec<String> {
+    wanted
+        .iter()
+        .filter(|id| tasks.iter().any(|t| &&t.id == id && is_open(&t.status)))
+        .cloned()
+        .collect()
+}
+
+/// The reminder to append to a conductor's tool result, or `None`.
+///
+/// Deliberately a fact about the workspace rather than advice. Mosaic's
+/// standing instructions already tell a conductor to prefer dispatching, and a
+/// conductor reads those once, at connect time. By the time it is twenty tool
+/// calls into building something itself, standing advice has lost to momentum:
+/// the observed behaviour is a conductor that writes the whole thing alone
+/// while several panes sit idle, which is the failure `set_conductor` already
+/// documents for a different reason.
+///
+/// What changes a decision is the state of the workspace at the moment of the
+/// decision, which is why this reports counts and names rather than repeating
+/// the advice louder.
+fn idle_pane_nudge(idle: &[String], since_last_dispatch_ms: Option<u64>) -> Option<String> {
+    if idle.len() < NUDGE_MIN_IDLE {
+        return None;
+    }
+    // `None` is "never dispatched in this workspace", which is the strongest
+    // case for saying something rather than a reason to stay quiet.
+    let quiet_for = match since_last_dispatch_ms {
+        Some(ms) if ms < NUDGE_AFTER_MS => return None,
+        Some(ms) => format!("Nothing has been dispatched for {}", human_ms(ms)),
+        None => "Nothing has been dispatched yet this session".to_string(),
+    };
+    Some(format!(
+        "\n[mosaic] {quiet_for} and {} pane(s) are idle: {}. If what you are \
+         working on divides into independent slices, hand some over rather than \
+         doing them in sequence yourself.\n",
+        idle.len(),
+        idle.join(", ")
+    ))
+}
+
+/// Whether enough quiet has passed to say it again. Zero means never said.
+fn nudge_is_due(last_ms: u64, now_ms: u64) -> bool {
+    last_ms == 0 || now_ms.saturating_sub(last_ms) >= NUDGE_EVERY_MS
+}
+
 fn append_line(path: &PathBuf, s: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
@@ -1221,6 +1406,18 @@ pub struct CompleteArgs {
     pub task_id: String,
     /// What you did / what you found.
     pub result: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct WaitArgs {
+    /// Task ids to wait for, separated by commas or spaces. Leave this out to
+    /// wait on every task you have dispatched that is still running.
+    #[serde(default)]
+    pub task_ids: String,
+    /// Give up after this many seconds and report what is still running.
+    /// Defaults to 600 and is capped at 1800.
+    #[serde(default)]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1371,8 +1568,10 @@ impl BrainHandler {
         if self.shared.conductor().as_deref() == Some(me.as_str()) {
             out.push_str(&format!(
                 "\nYou are the conductor: you can dispatch work to any of the other {peers} session(s). \
-                 Dispatch to several before polling, so their work overlaps rather than queues.\n"
+                 Dispatch to several, then call wait_for_tasks once with all their ids, so their \
+                 work overlaps rather than queues.\n"
             ));
+            out.push_str(&self.shared.nudge(&me));
         } else {
             out.push_str(
                 "\nYou are not the conductor, so dispatch will refuse — that is expected. \
@@ -1383,7 +1582,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id — it does NOT block — so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id — it does NOT block — so dispatch every independent piece of work first, then call wait_for_tasks once with all the ids, and the agents run in parallel while you wait in a single call. Needing the answer before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
@@ -1533,7 +1732,112 @@ impl BrainHandler {
                  task_id for one task in full.\n"
             ));
         }
+        out.push_str(&self.shared.nudge(&self.author()));
         out
+    }
+
+    #[tool(
+        description = "Block until work you dispatched finishes, then return its results. This is the companion to dispatch: dispatch every independent slice first, then call this once with all their task_ids, and they run in parallel while you wait in one call instead of polling. Reach for it whenever you would otherwise do a piece of work yourself because you needed the answer before continuing — waiting costs you nothing that doing it yourself would not have cost, and the other panes work at the same time. Leave task_ids empty to wait on everything you have dispatched that is still open. Returns as soon as they are all finished, or at the timeout with a note of what is still running; a timeout does NOT cancel anything, the agents keep working and their results are still accepted afterwards."
+    )]
+    async fn wait_for_tasks(&self, Parameters(p): Parameters<WaitArgs>) -> String {
+        let me = self.author();
+        let requested = parse_task_ids(&p.task_ids);
+
+        // Existence and ownership are settled before any blocking. Waiting ten
+        // minutes to be told an id was mistyped is the worst available answer,
+        // and it is the answer a naive poll loop gives.
+        for id in &requested {
+            match self.shared.task_status(&me, id) {
+                Ok(_) => {}
+                Err(TaskAccessError::Forbidden) => {
+                    return format!("Refused: task '{id}' was dispatched by a different session.");
+                }
+                Err(_) => {
+                    return format!(
+                        "No task '{id}'. Nothing was waited on — check the id against \
+                         get_task_result before waiting again."
+                    );
+                }
+            }
+        }
+
+        let wanted = if requested.is_empty() {
+            let open: Vec<String> = self
+                .shared
+                .tasks_from(&me)
+                .into_iter()
+                .filter(|t| is_open(&t.status))
+                .map(|t| t.id)
+                .collect();
+            if open.is_empty() {
+                return format!(
+                    "Nothing to wait for: none of your dispatched tasks are still running.{}",
+                    self.shared.nudge(&me)
+                );
+            }
+            open
+        } else {
+            requested
+        };
+
+        let deadline = Instant::now() + wait_timeout(p.timeout_seconds);
+        let waited_on = wanted.len();
+        loop {
+            // Stop is a user pressing a button, so it outranks the wait. A
+            // conductor blocked here would otherwise keep the workspace held
+            // for the full timeout after the user asked it to stop.
+            if self.shared.is_halted() {
+                return "Stopped: dispatch was halted by the user while waiting. \
+                        Collect what landed with get_task_result."
+                    .to_string();
+            }
+
+            let mine = self.shared.tasks_from(&me);
+            let open = still_open(&mine, &wanted);
+            if open.is_empty() {
+                let finished: Vec<Task> = mine
+                    .into_iter()
+                    .filter(|t| wanted.contains(&t.id))
+                    .collect();
+                let mut out = format!("# {waited_on} task(s) finished\n");
+                for t in &finished {
+                    out.push_str(&format!(
+                        "\n## {} → {}\n{}\n",
+                        t.id,
+                        t.target,
+                        render_task(t)
+                    ));
+                }
+                out.push_str(&self.shared.nudge(&me));
+                return out;
+            }
+
+            if Instant::now() >= deadline {
+                let mut out = format!(
+                    "Timed out with {} of {waited_on} task(s) still running: {}.\n\
+                     They have NOT been cancelled — the agents are still working and their \
+                     results are still accepted. Wait again, or collect what landed with \
+                     get_task_result.\n",
+                    open.len(),
+                    open.join(", ")
+                );
+                let done: Vec<Task> = mine
+                    .into_iter()
+                    .filter(|t| wanted.contains(&t.id) && !is_open(&t.status))
+                    .collect();
+                for t in &done {
+                    out.push_str(&format!(
+                        "\n## {} → {}\n{}\n",
+                        t.id,
+                        t.target,
+                        render_task(t)
+                    ));
+                }
+                return out;
+            }
+
+            tokio::time::sleep(Duration::from_millis(WAIT_POLL_MS)).await;
+        }
     }
 }
 
@@ -1541,14 +1845,17 @@ impl BrainHandler {
 mod tests {
     use super::{
         age, append_record, bearer_matches, busy_label, choose_reviewer, conductor_briefing,
-        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, injection_overage, is_open,
-        load_brain, mark_pending_error, mint_session_token, oversize_refusal, render_task,
-        render_task_summary, review_pending, select_tasks, task_for_dispatcher,
-        validate_path_component, AgentSession, Entry, Notifier, Shared, StoreRecord, Task,
-        TaskAccessError, RECENT_FINISHED, REVIEW_WAIVED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        dispatch_precheck, dispatch_prompt, finish_pending, human_ms, idle_pane_nudge,
+        injection_overage, is_open, load_brain, mark_pending_error, mint_session_token,
+        nudge_is_due, oversize_refusal, parse_task_ids, render_task, render_task_summary,
+        review_pending, select_tasks, still_open, task_for_dispatcher, validate_path_component,
+        wait_timeout, AgentSession, Entry, Notifier, Shared, StoreRecord, Task, TaskAccessError,
+        NUDGE_AFTER_MS, NUDGE_EVERY_MS, RECENT_FINISHED, REVIEW_WAIVED, TASK_ECHO_CHARS,
+        TASK_OVERDUE_MS, WAIT_DEFAULT_SECS, WAIT_MAX_SECS,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn a_free_pane_carries_no_busy_marker() {
@@ -1734,6 +2041,7 @@ mod tests {
             halted: Mutex::new(false),
             tasks: Mutex::new(Vec::new()),
             dispatches: Mutex::new(0),
+            last_nudge_ms: Mutex::new(0),
         });
         // `app` owns the runtime the handle points at, so it has to outlive the
         // handle. Leaking it is cheaper than threading it through every caller
@@ -2543,6 +2851,188 @@ mod tests {
         assert!(loaded.tasks.is_empty());
         assert!(load_brain(&temp.path().join("missing")).entries.is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // wait_for_tasks
+    // -----------------------------------------------------------------
+
+    fn task_with(id: &str, status: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            from: "sess-1".to_string(),
+            target: "sess-2".to_string(),
+            task: "audit the parser".to_string(),
+            status: status.to_string(),
+            result: String::new(),
+            ts_ms: 0,
+            reviewer: String::new(),
+            findings: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_omitted_timeout_waits_rather_than_returning_at_once() {
+        // The bug this pins. `#[serde(default)]` gives an omitted field zero,
+        // and reading zero as "wait zero seconds" would make the plainest call
+        // there is — wait_for_tasks with no arguments — return instantly and
+        // look like the tool does not work.
+        assert_eq!(wait_timeout(0), Duration::from_secs(WAIT_DEFAULT_SECS));
+    }
+
+    #[test]
+    fn a_wait_cannot_be_asked_to_last_forever() {
+        // The failure being bounded is an agent that took its prompt and will
+        // never answer. Nothing distinguishes that from slow work, so the only
+        // protection is refusing to wait past a ceiling on either.
+        assert_eq!(
+            wait_timeout(u64::MAX),
+            Duration::from_secs(WAIT_MAX_SECS),
+            "a caller asking for forever should still get a bounded wait"
+        );
+        assert_eq!(
+            wait_timeout(30),
+            Duration::from_secs(30),
+            "a sane request is honoured"
+        );
+    }
+
+    #[test]
+    fn task_ids_arrive_however_a_conductor_happens_to_separate_them() {
+        // These come from six separate dispatch replies being pasted into one
+        // argument, so the separator is whatever the model was writing at the
+        // time. Rejecting one of them is a refusal it has to guess its way past.
+        let expected = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        assert_eq!(parse_task_ids("aaa,bbb,ccc"), expected);
+        assert_eq!(parse_task_ids("aaa bbb ccc"), expected);
+        assert_eq!(parse_task_ids("aaa, bbb,  ccc"), expected);
+        assert_eq!(
+            parse_task_ids(" aaa,,bbb ,ccc "),
+            expected,
+            "empty entries are not ids"
+        );
+        assert!(
+            parse_task_ids("   ").is_empty(),
+            "blank means 'everything open'"
+        );
+    }
+
+    #[test]
+    fn work_submitted_but_unsigned_is_still_worth_waiting_for() {
+        // The interaction with the review gate, and the one most easily got
+        // wrong: `in_review` and `rework` mean the target reported back, but
+        // nobody has signed it off. Treating either as finished would return
+        // the conductor a result the gate has not passed, which is the exact
+        // thing the gate exists to prevent.
+        let tasks = vec![
+            task_with("a", "in_review"),
+            task_with("b", "rework"),
+            task_with("c", "done"),
+        ];
+        let wanted = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        assert_eq!(
+            still_open(&tasks, &wanted),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_overdue_task_is_still_waited_for_rather_than_given_up_on() {
+        // "overdue" is a reporting threshold, not a death certificate: the
+        // agent is still running and its result is still accepted. Returning
+        // as soon as one goes overdue would abandon work that is about to land.
+        let tasks = vec![task_with("a", "overdue")];
+        assert_eq!(
+            still_open(&tasks, &["a".to_string()]),
+            vec!["a".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_task_that_vanished_does_not_hold_the_wait_open_forever() {
+        // Every id is checked for existence before any blocking, so the only
+        // way one disappears mid-wait is the brain being re-pointed at another
+        // project. Blocking until the timeout on a task that no longer exists
+        // is the wrong answer to that.
+        let tasks = vec![task_with("a", "done")];
+        let wanted = vec!["a".to_string(), "gone".to_string()];
+
+        assert!(still_open(&tasks, &wanted).is_empty());
+    }
+
+    #[test]
+    fn waiting_only_reports_the_tasks_that_were_asked_for() {
+        // A conductor waiting on two of its six dispatches should not be held
+        // by the other four.
+        let tasks = vec![
+            task_with("a", "done"),
+            task_with("b", "done"),
+            task_with("elsewhere", "pending"),
+        ];
+        let wanted = vec!["a".to_string(), "b".to_string()];
+
+        assert!(still_open(&tasks, &wanted).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // The idle-pane nudge
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn one_spare_pane_is_not_worth_interrupting_for() {
+        // A workspace with a single free pane has nothing much spare. The
+        // reminder is about capacity going unused, not about pane arithmetic.
+        assert!(idle_pane_nudge(&["sess-2".to_string()], None).is_none());
+    }
+
+    #[test]
+    fn a_conductor_that_is_already_dispatching_is_left_alone() {
+        // The whole design risk here is becoming wallpaper. Someone who
+        // dispatched two minutes ago does not need telling how dispatch works.
+        let idle = vec!["sess-2".to_string(), "sess-3".to_string()];
+        assert!(idle_pane_nudge(&idle, Some(60_000)).is_none());
+    }
+
+    #[test]
+    fn never_having_dispatched_is_the_strongest_case_for_saying_something() {
+        // `None` means nothing has been handed out all session. Reading that
+        // as "no dispatch to compare against, so stay quiet" would silence the
+        // reminder in precisely the case it exists for.
+        let idle = vec!["sess-2".to_string(), "sess-3".to_string()];
+        let text = idle_pane_nudge(&idle, None).expect("should speak up");
+
+        assert!(text.contains("Nothing has been dispatched yet"), "{text}");
+    }
+
+    #[test]
+    fn the_reminder_names_the_panes_rather_than_repeating_the_advice() {
+        // Mosaic's standing instructions already say "prefer dispatching", and
+        // a conductor reads those once at connect time. What changes a decision
+        // twenty tool calls later is the state of the workspace right now, so
+        // this has to carry counts and names, not a louder version of the rule.
+        let idle = vec![
+            "sess-2".to_string(),
+            "sess-4".to_string(),
+            "sess-5".to_string(),
+        ];
+        let text = idle_pane_nudge(&idle, Some(NUDGE_AFTER_MS + 1)).expect("should speak up");
+
+        assert!(text.contains("sess-2, sess-4, sess-5"), "{text}");
+        assert!(text.contains("3 pane(s) are idle"), "{text}");
+    }
+
+    #[test]
+    fn a_reminder_is_not_repeated_until_the_workspace_has_been_quiet_again() {
+        // Rate limiting is what keeps this a signal. A line on every tool
+        // result is wallpaper within a few calls, and something always present
+        // carries the same information as something never present.
+        assert!(nudge_is_due(0, 1_000), "never said before, so say it");
+        assert!(!nudge_is_due(1_000, 1_000 + NUDGE_EVERY_MS - 1), "too soon");
+        assert!(
+            nudge_is_due(1_000, 1_000 + NUDGE_EVERY_MS),
+            "quiet period elapsed"
+        );
+    }
 }
 
 /// What every connecting agent is told about the workspace it just joined.
@@ -2571,7 +3061,8 @@ Mosaic gives exactly one session the conductor role, and the user assigns it; yo
 
 If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
 - Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices — different files or subsystems, separate research questions, a second opinion from a different model — are what the other sessions are for.
-- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
+- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first, then call wait_for_tasks once with all the ids; that is what makes the agents run in parallel instead of queueing behind each other.
+- Needing a result before you can continue is a reason to dispatch and wait, not a reason to do the work yourself. wait_for_tasks blocks in one call, so handing a slice over costs you no more time than doing it would have, and the other panes work while you wait.
 - Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
@@ -2728,6 +3219,7 @@ pub fn start(
         halted: Mutex::new(false),
         tasks: Mutex::new(brain.tasks),
         dispatches: Mutex::new(0),
+        last_nudge_ms: Mutex::new(0),
     });
 
     // Bind synchronously so we can hand the port back before the server task runs.
