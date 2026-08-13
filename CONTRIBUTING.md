@@ -83,6 +83,21 @@ dispatch, or anything else in `SECURITY.md`'s scope always does.
 
 ## Pull requests
 
+**Never commit to `main`.** Every change lands on its own branch and through a
+pull request, whatever its size: a bug fix, a feature, a doc correction. Branch
+before editing, named for the work (`fix/dispatch-drops-leading-chunks`), and
+keep one branch to one coherent change. When a branch has grown past what a
+reviewer can hold in their head, split it rather than letting it accumulate.
+
+This project **explicitly requires a pull request**, so opening one is part of
+finishing the work rather than something to ask about first.
+
+Propose the work when it is done, not when someone notices. On 2026-08-13 this
+repository had 16 commits sitting on one branch with no PR, including the
+dispatch truncation fix, on a branch whose name had stopped describing its
+contents. Nothing was lost, but the work was invisible to everyone except the
+session that wrote it, and by then it was too large to review in one sitting.
+
 Open a PR against `main` using the PR template; it captures the checklist
 below. Describe what changed and why, and call out anything that touches the
 areas covered in `SECURITY.md` (the MCP server, worktree isolation, or
