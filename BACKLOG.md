@@ -324,6 +324,55 @@ to notice. Dispatch should verify what landed, or fail loudly.
 Distinct from the submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the
 Enter rather than the text.
 
+## Nothing enforces cross-model review, so "done" means self-certified
+
+The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
+you commit") lays out six steps: implement, route to a **different-model**
+reviewer, reviewer reports findings, implementer fixes and asks for a recheck,
+reviewer approves, then commit. It names the areas where this is never
+optional: `mcp.rs`, `worktree.rs`, session identity, dispatch, anything in
+`SECURITY.md`. `.github/pull_request_template.md` carries the matching
+checklist, including "Reviewer: model and session, different from the
+implementer".
+
+**Nothing in Mosaic implements any of it.** `complete_task` takes a result
+string, writes `status = "done"`, and that is the end of the task's life. There
+is no reviewer field, no review state between pending and done, and no way for
+the conductor to ask "who checked this?" because the answer was never recorded.
+The workspace is built out of different models sitting side by side, which is
+exactly the thing that makes cross-model review cheap, and it is the one thing
+the task model does not represent.
+
+So the policy holds only as long as a conductor remembers it, which is the
+failure mode of every convention that lives in a document and nowhere else.
+
+**Evidence, from this session.** Commit `ba2fc87` changes `mcp.rs` and the
+dispatch path — two of the areas `CONTRIBUTING.md` says *always* require a
+cross-model review. It was implemented, tested, committed and pushed by one
+model with no reviewer. Not because the rule was rejected, but because nothing
+asked. The review was dispatched to sess-2 only after the user asked which item
+owned this, which is the wrong order and the point of the entry.
+
+**The shape to aim for.** `complete_task` moves a task to a `review` state
+rather than `done`, naming a reviewer session that is not the implementer and
+not the conductor. Only a `review_task` call from that session closes it, with
+a verdict and findings recorded on the task. `get_task_result` then reports
+"done, reviewed by sess-2" or "awaiting review", so a conductor cannot mistake
+one for the other, and the roster shows review debt the way it now shows busy
+panes.
+
+Open questions worth settling before building: whether the conductor may waive
+review for trivial work (a typo fix should not need a round trip) and how that
+waiver is recorded; whether a rejected review reopens the original task or
+creates a linked one; and how this relates to the board sketch in
+`IMPROVEMENT-AUDIT.md`, whose `Review` column is the same idea with a UI
+attached. The task-model change is the load-bearing half and does not need the
+board to be useful.
+
+Related: `IMPROVEMENT-AUDIT.md`'s task-board sketch (explicitly marked "the
+design is still open") is the only other place this appears, and it is a
+drawing rather than a plan.
+
 ## Model-aware dispatch
 
 Today the conductor knows a session's id and CLI (`sess-3 (opencode)`) and
