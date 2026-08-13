@@ -324,6 +324,43 @@ to notice. Dispatch should verify what landed, or fail loudly.
 Distinct from the submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the
 Enter rather than the text.
 
+## A conductor cannot wait for a dispatch, only re-ask whether it landed
+
+`get_task_result` is a poll. There is no call that blocks until a task
+finishes, and no notification when one does. So a conductor that dispatches
+work and has nothing else queued has exactly two options: guess an interval and
+poll, or say "I'll report when it lands" and then never actually look again.
+
+The second is what kept happening, and it is worse than it sounds, because the
+sentence reads like a commitment. The conductor is not lying; it has no
+mechanism behind the promise. Observed directly on 2026-08-13: a review was
+dispatched to sess-2, reported as "still pending", and the turn ended. The
+review had in fact completed. The only reason it was ever read is that the user
+asked why nothing was waiting on it.
+
+The workaround that does work, and what it shows: the task store is append-only
+JSONL at `<project>/.mosaic/context/brain.jsonl`, so a shell loop can poll the
+last record for a task id until its status leaves `pending`, and the harness
+notifies on exit. That works, and needing to reach around the MCP server into
+its own storage to find out whether a task finished is the argument for putting
+it in the server.
+
+**The shape to aim for.** A `wait_for_tasks` call that blocks until given task
+ids reach a terminal status or a timeout expires, returning the same payload
+`get_task_result` would. Blocking is the point: it collapses "dispatch, guess,
+poll, guess again" into one call, and it makes "I'll report when it lands" a
+thing the conductor can actually do.
+
+Worth settling before building: a maximum wait, since a hung pane must not hold
+a conductor forever, and it should interact with the overdue threshold rather
+than duplicate it; whether it returns on the first completion or all of them,
+with first being more useful for a fan-out where any result unblocks the next
+step; and whether the timeout return is distinguishable from completion, which
+it must be, or the conductor cannot tell "finished" from "gave up waiting".
+
+Related: the roster's busy and OVERDUE markers already tell a conductor a pane
+is slow. This is the other half, letting it act on that without spinning.
+
 ## Nothing enforces cross-model review, so "done" means self-certified
 
 The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
