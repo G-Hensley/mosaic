@@ -22,13 +22,65 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+/// The largest injection that cannot lose a byte on the way to a pane.
+///
+/// Delivery drops every *complete* leading 1 KiB chunk and lands only the
+/// trailing partial one (measured; see BACKLOG.md). An injection strictly
+/// under one chunk has no complete leading chunk, so there is nothing for the
+/// mechanism to take. That is what makes this a guarantee rather than a
+/// mitigation, and it holds whatever turns out to be doing the chunking.
+///
+/// The real ceiling a conductor feels is lower: the wrapper costs 82 bytes of
+/// header (matching the measured prefix) and 111 of completion contract, so
+/// about **830 bytes of brief** get through. That is tight, and deliberately
+/// so — a brief that does not fit is one that should have been split or put in
+/// a file. Once the chunking is found and fixed this constant is the single
+/// place to raise.
+const MAX_INJECTION_BYTES: usize = 1024;
+
+/// How far an injection exceeds what can be delivered intact, or `None` if it
+/// fits. Bytes, not chars: the truncation is a byte-buffer effect.
+fn injection_overage(injection: &str) -> Option<usize> {
+    let len = injection.len();
+    // `>=`, not `>`: at exactly 1024 there is one complete leading chunk, and
+    // it is the one that gets dropped.
+    (len >= MAX_INJECTION_BYTES).then(|| len - MAX_INJECTION_BYTES + 1)
+}
+
+/// The refusal for a brief too long to deliver whole, or `None` to proceed.
+///
+/// A free function for the same reason `dispatch_precheck` is one: `Shared`
+/// needs a Tauri `AppHandle` and cannot be built in a unit test, so policy
+/// that lives inside a method is policy nothing can assert on.
+///
+/// The message has to give the conductor the move, not just the verdict. It is
+/// read by a model deciding what to do next, and "too long" alone invites a
+/// retry of the same brief.
+fn oversize_refusal(injection: &str) -> Option<String> {
+    injection_overage(injection).map(|over| {
+        format!(
+            "brief is {over} bytes too long to deliver intact ({} bytes against a \
+             {MAX_INJECTION_BYTES} byte limit). Longer briefs reach the agent with the \
+             beginning silently missing. Split this into smaller tasks, or shorten it and \
+             point the agent at a file for the detail.",
+            injection.len()
+        )
+    })
+}
+
 fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
     // Keep the injection on one terminal line. Embedded CR/LF characters can
     // become unintended submit events in a target CLI. Preserve all other
     // whitespace because quoted commands and code fragments may depend on it.
     let task = task.replace("\r\n", " ").replace(['\r', '\n'], " ");
+
+    // Deliberately lean. Every byte spent here is a byte the brief cannot
+    // have before `MAX_INJECTION_BYTES` refuses the dispatch, so anything the
+    // agent can learn from an MCP tool call does not belong in the terminal.
     format!(
-        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} When finished, call the mosaic complete_task tool with task_id \"{task_id}\" and your result."
+        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} \
+         When done, call the mosaic complete_task tool with task_id \"{task_id}\" \
+         and your result."
     )
 }
 
@@ -571,11 +623,23 @@ impl Shared {
     ) -> Result<DispatchOutcome, String> {
         let target_is_live = self.engine.ids().iter().any(|i| i == target);
         dispatch_precheck(self.is_halted(), from, target, target_is_live)?;
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let injection = dispatch_prompt(from, &id, task);
+
+        // Checked before the budget is spent and before the task is recorded,
+        // so a refused dispatch costs nothing and leaves no phantom task for
+        // the conductor to poll. A brief this long was silently arriving with
+        // its first half missing; refusing is the honest outcome, and the
+        // conductor's fix is the one it should have made anyway.
+        if let Some(refusal) = oversize_refusal(&injection) {
+            return Err(refusal);
+        }
+
         if !self.take_dispatch_budget() {
             return Err("dispatch budget exhausted for this run.".to_string());
         }
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
         self.add_task(Task {
             id: id.clone(),
             from: from.to_string(),
@@ -590,7 +654,6 @@ impl Shared {
         // instruction. Submit Enter separately: Codex and Claude Code treat
         // text+CR in one PTY write as a paste and can leave it waiting in the
         // input editor — see `SessionManager::submit_to`.
-        let injection = dispatch_prompt(from, &id, task);
         let delivered = self.engine.submit_to(target, &injection);
         if !delivered {
             self.mark_delivery_failed(&id);
@@ -1193,10 +1256,10 @@ impl BrainHandler {
 mod tests {
     use super::{
         age, append_record, bearer_matches, busy_label, conductor_briefing, dispatch_precheck,
-        dispatch_prompt, finish_pending, human_ms, load_brain, mark_pending_error,
-        mint_session_token, render_task, render_task_summary, select_tasks, task_for_dispatcher,
-        validate_path_component, AgentSession, Entry, StoreRecord, Task, TaskAccessError,
-        RECENT_FINISHED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        dispatch_prompt, finish_pending, human_ms, injection_overage, load_brain,
+        mark_pending_error, mint_session_token, oversize_refusal, render_task, render_task_summary,
+        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry,
+        StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
     };
 
     #[test]
@@ -1314,6 +1377,66 @@ mod tests {
         assert!(!prompt.contains(['\r', '\n']));
         assert!(prompt.contains("audit this then report"));
         assert!(prompt.contains("task_id \"abc123\""));
+    }
+
+    #[test]
+    fn an_injection_within_the_limit_survives_the_observed_truncation() {
+        // The property the limit buys, stated as the corruption itself:
+        // replay the measured mechanism (every complete leading 1 KiB chunk is
+        // dropped, only the trailing partial chunk lands) and require the whole
+        // injection back. An earlier attempt put an integrity *footer* in the
+        // prompt instead; this test is what killed it. The surviving tail is
+        // `len % 1024` bytes, which can be a handful, so no footer of any
+        // length is guaranteed to arrive. Only staying under a chunk is.
+        let task = "x".repeat(800);
+        let prompt = dispatch_prompt("sess-1", "abc123", &task);
+        assert!(injection_overage(&prompt).is_none(), "fixture is too long");
+
+        let bytes = prompt.as_bytes();
+        let survived = &bytes[(bytes.len() / 1024) * 1024..];
+
+        assert_eq!(
+            String::from_utf8_lossy(survived),
+            prompt,
+            "an injection under one chunk must lose nothing"
+        );
+    }
+
+    #[test]
+    fn the_limit_bites_at_exactly_one_whole_chunk() {
+        // At 1024 there is one complete leading chunk and it is the one that
+        // gets dropped, so the boundary is `>=`. Asserted directly because an
+        // off-by-one here is invisible until a brief silently loses its head.
+        assert_eq!(injection_overage(&"x".repeat(1023)), None);
+        assert_eq!(injection_overage(&"x".repeat(1024)), Some(1));
+        assert_eq!(injection_overage(&"x".repeat(1030)), Some(7));
+    }
+
+    #[test]
+    fn a_realistic_brief_is_refused_with_a_move_the_conductor_can_make() {
+        // Sized from the measurement that started this: the 2645-byte dispatch
+        // that reached an opencode pane missing its first 2048 bytes. That one
+        // now refuses instead of arriving half-eaten.
+        let prompt = dispatch_prompt("sess-1", "abc123", &"x".repeat(2645));
+        let refusal = oversize_refusal(&prompt).expect("2645 bytes cannot arrive whole");
+
+        assert!(refusal.contains("too long to deliver intact"), "{refusal}");
+        // A verdict without a next move invites retrying the same brief.
+        assert!(
+            refusal.contains("Split this into smaller tasks"),
+            "{refusal}"
+        );
+        // The numbers have to be actionable, not decorative.
+        assert!(
+            refusal.contains(&format!("{} bytes against", prompt.len())),
+            "{refusal}"
+        );
+
+        assert_eq!(
+            oversize_refusal(&dispatch_prompt("sess-1", "abc123", "audit the parser")),
+            None,
+            "an ordinary brief must still go through"
+        );
     }
 
     // Both terminal injections share the same hard constraint: an embedded

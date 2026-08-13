@@ -272,9 +272,29 @@ entirely, and that difference is the next thing to test. The decisive
 reproduction spawns the real agent CLIs with deterministic startup and inspects
 the editor buffer before submission, comparing one write against paced chunks.
 
-Until that is known, `#20` (verify what landed, or fail loudly) is the useful
-work: it makes the corruption visible wherever it originates, which is worth
-having even after the cause is found.
+**Fixed by bounding the payload, 2026-08-12.** `dispatch` now refuses any
+injection of 1024 bytes or more (`MAX_INJECTION_BYTES` in `src/mcp.rs`) instead
+of sending it and hoping. The mechanism drops *complete* leading chunks only, so
+an injection under one chunk has no complete leading chunk and cannot lose a
+byte. That is a guarantee rather than a mitigation, and it does not depend on
+ever finding the cause.
+
+The refusal carries the move, not just the verdict: how many bytes over, and
+that the fix is to split the task or point the agent at a file. It runs before
+the dispatch budget is charged and before the task is recorded, so a refused
+dispatch leaves no phantom `pending` id to poll.
+
+The cost is real and is the reason to keep looking for the cause: the wrapper
+takes 82 bytes of header and 111 of completion contract, leaving about **830
+bytes of brief**. Raising that limit is what fixing this entry buys.
+
+*An approach that did not work, recorded so it is not retried.* The first
+attempt appended an integrity footer to the prompt: its own length and opening
+quoted back, for the agent to check. Two flaws, both found by its own tests. The
+surviving tail is `len % 1024` bytes, which can be a handful, so no footer of
+any length is guaranteed to arrive; and asking a model to verify a character
+count is asking it to do the one thing it is worst at. Delegating delivery
+integrity to the receiver cannot work when delivery is what is broken.
 
 The same session lost three dispatches to the same opencode pane this way. Each
 time the agent noticed and said so, which is luck: it answered the questions it
