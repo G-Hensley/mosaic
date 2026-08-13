@@ -233,8 +233,48 @@ correct while still corrupting longer ones.
 
 *It is not codex-specific.* This row is an **opencode** pane. The entry below
 points at `submit_to`'s `PASTE_START`/`PASTE_END` framing as the place to look
-first, and that framing is codex-only, so it cannot be the whole cause. Whatever
-drops the chunks sits in the shared write path, not in per-CLI framing.
+first, and that framing is codex-only, so it cannot be the whole cause.
+
+**The write path is not the cause either. Measured and refuted, 2026-08-12.**
+
+I concluded from the above that "whatever drops the chunks sits in the shared
+write path". That was wrong, and a chunking-and-pacing fix in `write_to` would
+have been a speculative change to code that is not broken.
+
+`src-tauri/tests/pty_truncation.rs` opens a PTY exactly as `spawn_session` does,
+writes offset-labelled payloads through the same `portable-pty` 0.9 master
+writer, and reads back what arrives:
+
+| requested | received | lost |
+|---:|---:|---:|
+| 512 | 512 | 0 |
+| 1024 | 1024 | 0 |
+| 2048 | 2048 | 0 |
+| 4096 | 4096 | 0 |
+| 8192 | 8192 | 0 |
+| 65536 | 65536 | 0 |
+
+Zero loss through 64 KiB, and a second case writes 64 KiB while the child is
+deliberately not draining for a second: still zero. A single `write_all`
+returns `Ok` and every byte arrives. Supporting reads: portable-pty's
+`take_writer` hands back the ConPTY stdin pipe's descriptor with no buffering of
+its own, and `filedescriptor` calls synchronous `WriteFile` and reports the real
+byte count, which `write_all` loops on.
+
+So Mosaic's one-call write, portable-pty's writer, the ConPTY input buffer, and
+a child that is not yet reading are all eliminated as causes.
+
+**What is left** is the target application's own terminal input handling. The
+1 KiB replacement pattern fits a reader or editor that keeps only its most
+recent input batch. Note the harness drained with `cmd /c more`, which reads
+stdin as a stream; a TUI reading console input events is a different path
+entirely, and that difference is the next thing to test. The decisive
+reproduction spawns the real agent CLIs with deterministic startup and inspects
+the editor buffer before submission, comparing one write against paced chunks.
+
+Until that is known, `#20` (verify what landed, or fail loudly) is the useful
+work: it makes the corruption visible wherever it originates, which is worth
+having even after the cause is found.
 
 The same session lost three dispatches to the same opencode pane this way. Each
 time the agent noticed and said so, which is luck: it answered the questions it
