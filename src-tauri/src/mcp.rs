@@ -33,7 +33,7 @@ use tauri::{AppHandle, Emitter};
 /// The real ceiling a conductor feels is lower: the wrapper costs 82 bytes of
 /// header (matching the measured prefix) and 111 of completion contract, so
 /// about **830 bytes of brief** get through. That is tight, and deliberately
-/// so — a brief that does not fit is one that should have been split or put in
+/// so â€” a brief that does not fit is one that should have been split or put in
 /// a file. Once the chunking is found and fixed this constant is the single
 /// place to raise.
 const MAX_INJECTION_BYTES: usize = 1024;
@@ -89,19 +89,19 @@ fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
 
 /// What a pane is told, in its own terminal, at the moment it becomes conductor.
 ///
-/// This is *typed into the composer and left there unsent* — see `set_conductor`
+/// This is *typed into the composer and left there unsent* â€” see `set_conductor`
 /// for why. That shapes the text: it has to be short enough to read at a glance
 /// and to type after, because the user is expected to append their actual first
 /// instruction to it and send both together.
 ///
 /// So this carries only what MCP cannot: the role is live *now*, and who is
-/// actually running. The playbook — how to write a task, recording decisions
-/// first, subagents versus sessions — is already in BRAIN_INSTRUCTIONS, which
+/// actually running. The playbook â€” how to write a task, recording decisions
+/// first, subagents versus sessions â€” is already in BRAIN_INSTRUCTIONS, which
 /// every agent receives on connect. Repeating it here just buried the two facts
 /// that were new.
 fn conductor_briefing(peers: &[String]) -> String {
     // Single line: a newline lands in most composers as a submit, which would
-    // fire this off half-written — exactly what we are avoiding.
+    // fire this off half-written â€” exactly what we are avoiding.
     let roster = if peers.is_empty() {
         "No other sessions are open yet (Ctrl+K opens one).".to_string()
     } else {
@@ -175,6 +175,30 @@ pub struct Task {
     /// rejection whose reasons are discarded makes the next attempt guesswork.
     #[serde(default)]
     pub findings: String,
+    /// When this task reached a terminal state, if it has. Distinct from
+    /// `ts_ms`, which is stamped once at dispatch and never moves â€” reading
+    /// that as a completion time says a task "finished" the moment it was
+    /// handed out.
+    ///
+    /// `None` while the task is still live, including `in_review` and
+    /// `rework`: neither is finished, so neither may claim a finish time.
+    ///
+    /// This is what lets the UI tell a result that just arrived from one that
+    /// was already sitting in the store at startup. Without it, a restart
+    /// cannot distinguish them and announces the whole history at once.
+    ///
+    /// `serde(default)` for the same reason as the fields above: tasks already
+    /// written to `brain.jsonl` predate it, and they load as `None`, which is
+    /// the honest answer for a task whose finish time was never recorded.
+    #[serde(default)]
+    pub done_ms: Option<u64>,
+}
+
+/// Terminal states â€” the ones that stamp `done_ms` and never accept a result
+/// afterwards. `in_review` and `rework` are deliberately absent: the work
+/// exists but has not been signed off, which is the whole point of them.
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "done" | "cancelled" | "error")
 }
 
 const STORE_FILE: &str = "brain.jsonl";
@@ -248,7 +272,7 @@ const MAX_DISPATCHES: u32 = 40;
 const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 
 /// A task record was created and delivery was attempted. `delivered` is false
-/// when the prompt could not be written to the target's terminal — the task
+/// when the prompt could not be written to the target's terminal â€” the task
 /// still exists, in "error" status, rather than vanishing silently the way a
 /// failed dispatch used to.
 #[derive(Clone, Debug, Serialize)]
@@ -262,7 +286,7 @@ pub struct DispatchOutcome {
 }
 
 /// The checks a dispatch must pass before any task record is created, in the
-/// order they're applied — that order is what decides which message wins when
+/// order they're applied â€” that order is what decides which message wins when
 /// more than one would refuse. Kept pure (no lock, no I/O) so it's testable
 /// without a live `Shared`, which needs a real `AppHandle` to construct.
 ///
@@ -302,7 +326,7 @@ fn dispatch_precheck(
 /// A seam, for one reason: `Shared` used to hold an `AppHandle` directly, and
 /// an `AppHandle` cannot be built outside a running app. That made every policy
 /// living on a `Shared` method unreachable from a test, so it could only be
-/// verified by reading the code — which is exactly how the dispatch gate's
+/// verified by reading the code â€” which is exactly how the dispatch gate's
 /// ordering went untested until a reviewer asked.
 ///
 /// `tauri::test::mock_app()` is the other way to solve this, but its handle is
@@ -313,7 +337,7 @@ fn dispatch_precheck(
 /// point. Holding an `AppHandle` anywhere in `Shared`'s type graph makes the
 /// compiler instantiate `AppHandle<Wry>`'s drop glue for any test that builds a
 /// `Shared`, which drags Wry's runtime into the test binary and fails it at
-/// *load* time with `STATUS_ENTRYPOINT_NOT_FOUND` — before a single test runs,
+/// *load* time with `STATUS_ENTRYPOINT_NOT_FOUND` â€” before a single test runs,
 /// with no hint as to the cause. Erasing the handle behind `dyn Fn` keeps it
 /// out of `Shared` entirely.
 /// Named so the `Notifier` field stays readable; clippy flags the raw form as
@@ -342,7 +366,7 @@ impl Notifier {
     }
 }
 
-/// The shared store — one instance, cloned by Arc into every agent's handler.
+/// The shared store â€” one instance, cloned by Arc into every agent's handler.
 pub struct Shared {
     app: Notifier,
     /// Where entries are mirrored as markdown. Follows the picked project, so it
@@ -352,7 +376,7 @@ pub struct Shared {
     sessions: Mutex<Vec<AgentSession>>,
     /// agent name -> brain (room). The app owns this; drag reassigns it live.
     name_to_room: Mutex<HashMap<String, String>>,
-    /// The live session engine — lets dispatch type into a target's terminal.
+    /// The live session engine â€” lets dispatch type into a target's terminal.
     engine: Arc<crate::SessionManager>,
     /// Which agent (if any) is the conductor. Set by the app, never self-claimed.
     conductor: Mutex<Option<String>>,
@@ -519,7 +543,7 @@ impl Shared {
     ///
     /// The briefing is typed into the composer but deliberately NOT submitted.
     /// Auto-sending it made promotion silently spend a turn on a prompt the user
-    /// never wrote, and left them no way to say what they actually wanted done —
+    /// never wrote, and left them no way to say what they actually wanted done â€”
     /// the pane just started talking. Leaving it unsent turns a hijacked turn
     /// into a prefilled one: the user appends their real first instruction and
     /// sends both together, so the agent learns its role and its task at once.
@@ -556,10 +580,12 @@ impl Shared {
     pub fn set_halted(&self, v: bool) {
         *self.halted.lock().unwrap() = v;
         if v {
+            let now = Self::now_ms();
             let mut changed = Vec::new();
             for t in self.tasks.lock().unwrap().iter_mut() {
                 if t.status == "pending" {
                     t.status = "cancelled".to_string();
+                    t.done_ms = Some(now);
                     changed.push(t.clone());
                 }
             }
@@ -611,6 +637,7 @@ impl Shared {
             id,
             approved,
             findings,
+            Self::now_ms(),
         )?;
         let task = self
             .tasks
@@ -630,7 +657,13 @@ impl Shared {
     /// happened to it. "Result recorded" is the wrong thing to say when the
     /// work has gone to a reviewer and is not finished.
     fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<Task, TaskAccessError> {
-        finish_pending(&mut self.tasks.lock().unwrap(), caller, id, result)?;
+        finish_pending(
+            &mut self.tasks.lock().unwrap(),
+            caller,
+            id,
+            result,
+            Self::now_ms(),
+        )?;
         let task = self
             .tasks
             .lock()
@@ -648,7 +681,7 @@ impl Shared {
     /// Mark a recorded task as errored when terminal delivery fails. A task
     /// that completed or was cancelled concurrently is never overwritten.
     fn mark_delivery_failed(&self, id: &str) {
-        let changed = mark_pending_error(&mut self.tasks.lock().unwrap(), id);
+        let changed = mark_pending_error(&mut self.tasks.lock().unwrap(), id, Self::now_ms());
         if changed {
             if let Some(task) = self
                 .tasks
@@ -709,11 +742,11 @@ impl Shared {
 
     /// Validate and hand a task to a live session: the shared core of the
     /// agent-facing `dispatch` MCP tool and the human-facing `human_dispatch`
-    /// Tauri command (lib.rs) — one ledger and one set of rules regardless of
+    /// Tauri command (lib.rs) â€” one ledger and one set of rules regardless of
     /// who started the task. Conductor-only enforcement is deliberately NOT
     /// here: that's an MCP-specific policy the `dispatch` tool applies before
     /// calling this, and `human_dispatch` has no agent identity to check it
-    /// against — the human already decided who to promote.
+    /// against â€” the human already decided who to promote.
     ///
     /// The task record is created in "pending" status BEFORE `submit_to` is
     /// called. That closes the original race while still allowing an unusually
@@ -756,12 +789,13 @@ impl Shared {
             ts_ms: Self::now_ms(),
             reviewer: reviewer.clone(),
             findings: String::new(),
+            done_ms: None,
         });
 
         // Typed into the target's terminal, so the human sees every
         // instruction. Submit Enter separately: Codex and Claude Code treat
         // text+CR in one PTY write as a paste and can leave it waiting in the
-        // input editor — see `SessionManager::submit_to`.
+        // input editor â€” see `SessionManager::submit_to`.
         let delivered = self.engine.submit_to(target, &injection);
         if !delivered {
             self.mark_delivery_failed(&id);
@@ -844,6 +878,7 @@ fn finish_pending(
     caller: &str,
     id: &str,
     result: &str,
+    now_ms: u64,
 ) -> Result<(), TaskAccessError> {
     match tasks.iter_mut().find(|t| t.id == id) {
         Some(t) if t.target != caller => Err(TaskAccessError::Forbidden),
@@ -860,6 +895,12 @@ fn finish_pending(
             } else {
                 "in_review".to_string()
             };
+            // Only the ungated path finished here. Work that went to a reviewer
+            // finishes when they sign off, so stamping it now would date it to
+            // the submission instead.
+            if is_terminal(&t.status) {
+                t.done_ms = Some(now_ms);
+            }
             Ok(())
         }
         None => Err(TaskAccessError::NotFound),
@@ -877,6 +918,7 @@ fn review_pending(
     id: &str,
     approved: bool,
     findings: &str,
+    now_ms: u64,
 ) -> Result<(), TaskAccessError> {
     match tasks.iter_mut().find(|t| t.id == id) {
         // Only the named reviewer. Not the implementer, who would be
@@ -889,6 +931,12 @@ fn review_pending(
             // The result stays: the reviewer is judging a specific submission
             // and discarding it would lose what they were judging.
             t.status = if approved { "done" } else { "rework" }.to_string();
+            // Sign-off is where reviewed work actually finishes. A rejection
+            // sends it back to "rework", which is live again, so it keeps its
+            // empty finish time.
+            if is_terminal(&t.status) {
+                t.done_ms = Some(now_ms);
+            }
             Ok(())
         }
         None => Err(TaskAccessError::NotFound),
@@ -982,13 +1030,14 @@ fn validate_path_component(label: &str, value: &str) -> Result<(), String> {
 
 /// Mark delivery failure only while the task is still pending. Completion or
 /// cancellation that wins the race remains authoritative.
-fn mark_pending_error(tasks: &mut [Task], id: &str) -> bool {
+fn mark_pending_error(tasks: &mut [Task], id: &str, now_ms: u64) -> bool {
     match tasks
         .iter_mut()
         .find(|t| t.id == id && t.status == "pending")
     {
         Some(t) => {
             t.status = "error".to_string();
+            t.done_ms = Some(now_ms);
             true
         }
         None => false,
@@ -1018,10 +1067,10 @@ fn render_task(t: &Task) -> String {
     };
 
     if t.result.is_empty() {
-        format!("[{}]{} {} → {}", t.status, sign_off, t.target, t.task)
+        format!("[{}]{} {} â†’ {}", t.status, sign_off, t.target, t.task)
     } else {
         format!(
-            "[{}]{} {} → {}\n{}{}",
+            "[{}]{} {} â†’ {}\n{}{}",
             t.status, sign_off, t.target, t.task, t.result, findings
         )
     }
@@ -1060,9 +1109,9 @@ fn truncate_chars(s: &str, limit: usize) -> String {
 fn render_task_summary(t: &Task) -> String {
     let brief = truncate_chars(&t.task, TASK_ECHO_CHARS);
     if t.status == "done" {
-        format!("[done] {} → {}\n{}", t.target, brief, t.result)
+        format!("[done] {} â†’ {}\n{}", t.target, brief, t.result)
     } else {
-        format!("[{}] {} → {}", t.status, t.target, brief)
+        format!("[{}] {} â†’ {}", t.status, t.target, brief)
     }
 }
 
@@ -1109,7 +1158,7 @@ pub struct BrainHandler {
     shared: Arc<Shared>,
     identity: Arc<Mutex<Option<AgentSession>>>,
     /// Set when this handler serves ONE specific session on its own endpoint.
-    /// Identity then comes from the connection — it can't be forgotten or spoofed,
+    /// Identity then comes from the connection â€” it can't be forgotten or spoofed,
     /// so the agent never has to declare a name.
     bound: Option<String>,
     // Used by the #[tool_handler]-generated code, which dead-code analysis can't see.
@@ -1127,7 +1176,7 @@ impl BrainHandler {
         }
     }
 
-    /// A handler dedicated to one session — used by that session's own endpoint.
+    /// A handler dedicated to one session â€” used by that session's own endpoint.
     pub fn bound_to(shared: Arc<Shared>, session: String) -> Self {
         Self {
             shared,
@@ -1192,7 +1241,7 @@ pub struct SearchArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DispatchArgs {
-    /// The session to hand the task to — use an id from list_sessions.
+    /// The session to hand the task to â€” use an id from list_sessions.
     pub target: String,
     /// The task, written the way you'd say it to a teammate.
     pub task: String,
@@ -1253,7 +1302,7 @@ impl BrainHandler {
                     return format!("Refused: {e}.");
                 }
             }
-            return format!("Already identified as '{b}' — Mosaic knows this session.");
+            return format!("Already identified as '{b}' â€” Mosaic knows this session.");
         }
         let session = AgentSession {
             name: p.name.clone(),
@@ -1287,7 +1336,7 @@ impl BrainHandler {
         let body = if p.rationale.is_empty() {
             p.decision
         } else {
-            format!("{} — {}", p.decision, p.rationale)
+            format!("{} â€” {}", p.decision, p.rationale)
         };
         self.shared.add("decision", &self.author(), &p.topic, &body);
         "Decision recorded to the shared brain.".to_string()
@@ -1319,7 +1368,7 @@ impl BrainHandler {
         if mine.is_empty() {
             return format!("No shared context yet in brain '{room}'.");
         }
-        let mut out = format!("# Shared context — brain '{room}' (most recent first)\n");
+        let mut out = format!("# Shared context â€” brain '{room}' (most recent first)\n");
         for e in mine.iter().rev().take(50) {
             out.push_str(&format!(
                 "- [{}] ({}) {}: {}\n",
@@ -1375,7 +1424,7 @@ impl BrainHandler {
             ));
         } else {
             out.push_str(
-                "\nYou are not the conductor, so dispatch will refuse — that is expected. \
+                "\nYou are not the conductor, so dispatch will refuse â€” that is expected. \
                  You can still reach these agents through record_decision, record_fact and broadcast.\n",
             );
         }
@@ -1383,13 +1432,13 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id — it does NOT block — so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
+        description = "Conductor only: hand a task to another live AI agent in this workspace. Returns immediately with a task_id â€” it does NOT block â€” so dispatch every independent piece of work first and collect afterwards with get_task_result, and the agents run in parallel. Reach for this before doing a separable chunk of work yourself: each target is a different model with its own context window. Write the task as you would brief a colleague who cannot see your screen: the goal, the paths involved, and what to report back. Work is reviewed by default: if you do not name a reviewer, one is picked for you and the result goes to in_review before done. Name a reviewer to choose who, ideally a different model from the target, and you may name yourself. Pass reviewer 'none' only when you have decided the work does not need checking."
     )]
     fn dispatch(&self, Parameters(p): Parameters<DispatchArgs>) -> String {
         let me = self.author();
 
         // Conductor-only is MCP-specific policy, so it's checked here rather
-        // than in `dispatch_task` — see that method's doc comment.
+        // than in `dispatch_task` â€” see that method's doc comment.
         if self.shared.is_halted() {
             return "Refused: dispatch is halted by the user (Stop). Do not retry.".to_string();
         }
@@ -1414,7 +1463,7 @@ impl BrainHandler {
                 p.target, o.task_id
             ),
             Ok(o) => format!(
-                "Task {} recorded for {} but delivery failed (could not write to that session) — status is 'error'.",
+                "Task {} recorded for {} but delivery failed (could not write to that session) â€” status is 'error'.",
                 o.task_id, p.target
             ),
         }
@@ -1432,7 +1481,7 @@ impl BrainHandler {
                 "Result recorded and sent to {} for review. It is NOT done yet: if they send                  it back the status becomes 'rework' and you should fix what they raise and                  call complete_task again.",
                 t.reviewer
             ),
-            Ok(_) => "Result recorded — the conductor can now read it.".to_string(),
+            Ok(_) => "Result recorded â€” the conductor can now read it.".to_string(),
             Err(TaskAccessError::Forbidden) => {
                 "Refused: this task is assigned to a different session.".to_string()
             }
@@ -1476,7 +1525,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once — do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
+        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once â€” do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it. in_review means the work is submitted and waiting on its reviewer; rework means the reviewer sent it back and the agent is fixing it. Neither is finished, and only done means a reviewer signed off (or that review was explicitly waived, which the output tells you)."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -1520,7 +1569,7 @@ impl BrainHandler {
         };
         for t in &shown {
             out.push_str(&format!(
-                "\n## {} → {}\n{}\n",
+                "\n## {} â†’ {}\n{}\n",
                 t.id,
                 t.target,
                 render_task_summary(t)
@@ -1555,6 +1604,121 @@ mod tests {
         assert_eq!(busy_label(None), "");
     }
 
+    // ---- done_ms: when a task actually finished ----
+    //
+    // These exist because the UI used `ts_ms` for this and `ts_ms` never moves
+    // off the dispatch time. Reading it as a finish time made every task in the
+    // store look like it had just completed, which is what made a restart
+    // announce the entire history at once.
+
+    /// Dispatch time and finish time must be able to disagree, because the
+    /// whole bug was code that assumed they could not.
+    const DISPATCHED_AT: u64 = 1_000;
+    const FINISHED_AT: u64 = 9_000;
+
+    fn dispatched_task(reviewer: &str) -> Vec<Task> {
+        vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: DISPATCHED_AT,
+            reviewer: reviewer.into(),
+            findings: String::new(),
+            done_ms: None,
+        }]
+    }
+
+    #[test]
+    fn a_live_task_has_no_finish_time() {
+        let tasks = dispatched_task("");
+        assert_eq!(
+            tasks[0].done_ms, None,
+            "a task that has not finished must not claim a finish time"
+        );
+    }
+
+    #[test]
+    fn an_unreviewed_task_is_stamped_when_its_result_lands() {
+        let mut tasks = dispatched_task("");
+        finish_pending(&mut tasks, "sess-2", "abc123", "the report", FINISHED_AT).unwrap();
+
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(tasks[0].done_ms, Some(FINISHED_AT));
+        assert_eq!(
+            tasks[0].ts_ms, DISPATCHED_AT,
+            "stamping the finish must not disturb the dispatch time"
+        );
+    }
+
+    #[test]
+    fn submitting_for_review_is_not_finishing() {
+        // The case that makes a separate field necessary rather than reusing
+        // ts_ms: the work exists, but nobody has signed it off.
+        let mut tasks = dispatched_task("sess-3");
+        finish_pending(&mut tasks, "sess-2", "abc123", "the report", FINISHED_AT).unwrap();
+
+        assert_eq!(tasks[0].status, "in_review");
+        assert_eq!(
+            tasks[0].done_ms, None,
+            "in_review is not finished, so it must carry no finish time"
+        );
+    }
+
+    #[test]
+    fn sign_off_is_what_finishes_reviewed_work() {
+        let mut tasks = dispatched_task("sess-3");
+        finish_pending(&mut tasks, "sess-2", "abc123", "the report", FINISHED_AT).unwrap();
+        review_pending(&mut tasks, "sess-3", "abc123", true, "correct", 12_000).unwrap();
+
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(
+            tasks[0].done_ms,
+            Some(12_000),
+            "reviewed work finishes when the reviewer signs off, not when it was submitted"
+        );
+    }
+
+    #[test]
+    fn a_rejected_review_leaves_the_task_unfinished() {
+        let mut tasks = dispatched_task("sess-3");
+        finish_pending(&mut tasks, "sess-2", "abc123", "first attempt", FINISHED_AT).unwrap();
+        review_pending(&mut tasks, "sess-3", "abc123", false, "untested", 12_000).unwrap();
+
+        assert_eq!(tasks[0].status, "rework");
+        assert_eq!(
+            tasks[0].done_ms, None,
+            "rework is live again, so it must not carry a finish time"
+        );
+    }
+
+    #[test]
+    fn a_delivery_failure_is_a_finish() {
+        let mut tasks = dispatched_task("");
+        assert!(mark_pending_error(&mut tasks, "abc123", FINISHED_AT));
+
+        assert_eq!(tasks[0].status, "error");
+        assert_eq!(
+            tasks[0].done_ms,
+            Some(FINISHED_AT),
+            "an errored task is terminal, and the UI has to be able to date it"
+        );
+    }
+
+    #[test]
+    fn a_task_from_a_previous_run_loads_without_a_finish_time() {
+        // Every task already in brain.jsonl predates this field. They must load
+        // rather than break the store, and None is the honest answer for a
+        // finish time that was never recorded.
+        let stored = r#"{"id":"old1","from":"sess-1","target":"sess-2","task":"t","status":"done","result":"r","ts_ms":5}"#;
+        let task: Task = serde_json::from_str(stored).expect("an older task must still load");
+
+        assert_eq!(task.status, "done");
+        assert_eq!(task.done_ms, None);
+    }
+
     #[test]
     fn a_pane_past_the_overdue_window_is_called_out_not_just_timed() {
         // Both strings carry the same number. Only one tells a conductor to
@@ -1587,6 +1751,7 @@ mod tests {
             status: status.into(),
             result: String::new(),
             ts_ms,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         }
@@ -1801,7 +1966,7 @@ mod tests {
     // Both terminal injections share the same hard constraint: an embedded
     // newline submits the message to the target CLI in fragments, so the agent
     // acts on half a briefing. It matters more for the briefing than for a
-    // dispatch, because the briefing is left unsent on purpose — a stray newline
+    // dispatch, because the briefing is left unsent on purpose â€” a stray newline
     // would fire it off before the user has added anything.
     #[test]
     fn conductor_briefing_is_single_line_and_names_the_peers() {
@@ -1852,6 +2017,7 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         };
@@ -1879,6 +2045,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             ts_ms: 0,
+            done_ms: None,
         };
         assert!(render_task(&base).starts_with("[error]"));
     }
@@ -1921,11 +2088,12 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         }];
         assert_eq!(
-            finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs"),
+            finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
             Ok(())
         );
         assert_eq!(tasks[0].status, "done");
@@ -1936,7 +2104,7 @@ mod tests {
     fn finish_pending_refuses_an_unknown_id() {
         let mut tasks: Vec<Task> = vec![];
         assert_eq!(
-            finish_pending(&mut tasks, "sess-2", "nope", "result"),
+            finish_pending(&mut tasks, "sess-2", "nope", "result", 0),
             Err(TaskAccessError::NotFound)
         );
     }
@@ -1951,12 +2119,13 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         }];
 
         assert_eq!(
-            finish_pending(&mut tasks, "sess-3", "abc123", "stolen"),
+            finish_pending(&mut tasks, "sess-3", "abc123", "stolen", 0),
             Err(TaskAccessError::Forbidden)
         );
         assert_eq!(tasks[0].status, "pending");
@@ -1973,6 +2142,7 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         }];
@@ -2050,10 +2220,11 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         }];
-        assert!(mark_pending_error(&mut tasks, "abc123"));
+        assert!(mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "error");
     }
 
@@ -2072,8 +2243,9 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             ts_ms: 0,
+            done_ms: None,
         }];
-        assert!(!mark_pending_error(&mut tasks, "abc123"));
+        assert!(!mark_pending_error(&mut tasks, "abc123", 0));
         assert_eq!(tasks[0].status, "cancelled");
     }
 
@@ -2087,6 +2259,7 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         };
@@ -2117,6 +2290,7 @@ mod tests {
             status: "pending".into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: String::new(),
             findings: String::new(),
         }];
@@ -2125,7 +2299,7 @@ mod tests {
         assert_eq!(tasks[0].status, "overdue");
 
         assert_eq!(
-            finish_pending(&mut tasks, "sess-2", "abc123", "here is the report"),
+            finish_pending(&mut tasks, "sess-2", "abc123", "here is the report", 0),
             Ok(())
         );
         assert_eq!(tasks[0].status, "done");
@@ -2147,9 +2321,10 @@ mod tests {
                 reviewer: String::new(),
                 findings: String::new(),
                 ts_ms: 0,
+                done_ms: None,
             }];
             assert_eq!(
-                finish_pending(&mut tasks, "sess-2", "abc123", "late overwrite"),
+                finish_pending(&mut tasks, "sess-2", "abc123", "late overwrite", 0),
                 Err(TaskAccessError::NotPending),
                 "{status} must not accept a result"
             );
@@ -2170,9 +2345,10 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             ts_ms: 0,
+            done_ms: None,
         }];
         assert_eq!(
-            finish_pending(&mut tasks, "sess-3", "abc123", "stolen"),
+            finish_pending(&mut tasks, "sess-3", "abc123", "stolen", 0),
             Err(TaskAccessError::Forbidden)
         );
         assert_eq!(tasks[0].status, "overdue");
@@ -2204,6 +2380,7 @@ mod tests {
             reviewer: String::new(),
             findings: String::new(),
             ts_ms: 2,
+            done_ms: None,
         };
         let done = Task {
             status: "done".into(),
@@ -2235,6 +2412,7 @@ mod tests {
             status: status.into(),
             result: String::new(),
             ts_ms: 0,
+            done_ms: None,
             reviewer: "sess-3".into(),
             findings: String::new(),
         }
@@ -2247,7 +2425,7 @@ mod tests {
         let mut tasks = vec![reviewed_task("pending")];
 
         assert_eq!(
-            finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs"),
+            finish_pending(&mut tasks, "sess-2", "abc123", "found two bugs", 0),
             Ok(())
         );
 
@@ -2265,7 +2443,7 @@ mod tests {
         }];
 
         assert_eq!(
-            finish_pending(&mut tasks, "sess-2", "abc123", "fixed"),
+            finish_pending(&mut tasks, "sess-2", "abc123", "fixed", 0),
             Ok(())
         );
 
@@ -2280,12 +2458,12 @@ mod tests {
         let mut tasks = vec![reviewed_task("in_review")];
 
         assert_eq!(
-            review_pending(&mut tasks, "sess-2", "abc123", true, "looks fine to me"),
+            review_pending(&mut tasks, "sess-2", "abc123", true, "looks fine to me", 0),
             Err(TaskAccessError::Forbidden),
             "the implementer must not be able to approve its own work"
         );
         assert_eq!(
-            review_pending(&mut tasks, "sess-4", "abc123", true, "sure"),
+            review_pending(&mut tasks, "sess-4", "abc123", true, "sure", 0),
             Err(TaskAccessError::Forbidden),
             "a bystander must not be able to approve it either"
         );
@@ -2306,7 +2484,8 @@ mod tests {
                 "sess-3",
                 "abc123",
                 true,
-                "correct, one nit accepted"
+                "correct, one nit accepted",
+                0
             ),
             Ok(())
         );
@@ -2330,7 +2509,8 @@ mod tests {
                 "sess-3",
                 "abc123",
                 false,
-                "the ordering claim is untested"
+                "the ordering claim is untested",
+                0
             ),
             Ok(())
         );
@@ -2343,7 +2523,7 @@ mod tests {
 
         // And back round again.
         assert_eq!(
-            finish_pending(&mut tasks, "sess-2", "abc123", "second attempt, test added"),
+            finish_pending(&mut tasks, "sess-2", "abc123", "second attempt, test added", 0),
             Ok(())
         );
         assert_eq!(
@@ -2357,18 +2537,18 @@ mod tests {
     fn a_task_can_only_be_reviewed_once_and_only_when_submitted() {
         let mut tasks = vec![reviewed_task("pending")];
         assert_eq!(
-            review_pending(&mut tasks, "sess-3", "abc123", true, ""),
+            review_pending(&mut tasks, "sess-3", "abc123", true, "", 0),
             Err(TaskAccessError::NotPending),
             "nothing has been submitted yet, so there is nothing to sign off"
         );
 
         tasks[0].status = "in_review".into();
         assert_eq!(
-            review_pending(&mut tasks, "sess-3", "abc123", true, "ok"),
+            review_pending(&mut tasks, "sess-3", "abc123", true, "ok", 0),
             Ok(())
         );
         assert_eq!(
-            review_pending(&mut tasks, "sess-3", "abc123", false, "changed my mind"),
+            review_pending(&mut tasks, "sess-3", "abc123", false, "changed my mind", 0),
             Err(TaskAccessError::NotPending),
             "a signed-off task must not be reopened by a second review"
         );
@@ -2551,13 +2731,13 @@ mod tests {
 /// told to consult shared context simply won't, and the brain stays empty while
 /// two agents build incompatible halves of the same thing. MCP carries these
 /// instructions on the connection itself, which is why this lives here rather
-/// than in each project's AGENTS.md — it reaches every session automatically,
+/// than in each project's AGENTS.md â€” it reaches every session automatically,
 /// in whichever repo it was launched against.
 ///
 /// The workspace section exists for a second, distinct failure: an agent that
 /// treats Mosaic as a nicer terminal and never notices the other panes are
 /// usable capacity. Because MCP delivers this text once, at connect time, it can
-/// only describe the role an agent *might* be given — the conductor briefing
+/// only describe the role an agent *might* be given â€” the conductor briefing
 /// injected by `set_conductor` is what covers the role it actually has.
 const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
 
@@ -2565,31 +2745,31 @@ Mosaic already knows who you are from this connection. You do not need to call s
 
 ## The workspace
 
-The other panes are not logs or history. They are live AI coding agents — often different models, each with its own separate context window — sitting idle until given work. Call list_sessions to see who is here.
+The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
 
 Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
 
 If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
-- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices — different files or subsystems, separate research questions, a second opinion from a different model — are what the other sessions are for.
+- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
 - dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
 - Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
 - A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
 - This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
 
-If you are NOT the conductor, dispatch will refuse — that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
+If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
 
 ## Shared context
 
-- BEFORE making a decision that affects shared work — architecture, dependencies, data models, API shapes, file layout, naming conventions — call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
+- BEFORE making a decision that affects shared work â€” architecture, dependencies, data models, API shapes, file layout, naming conventions â€” call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
 - Use search_context to check one specific topic before you spend effort researching it.
-- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here — it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
+- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here â€” it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
 - Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
 - Use broadcast for blockers, or anything the others need to know immediately."#;
 
 #[tool_handler]
 impl ServerHandler for BrainHandler {
     // Supplying get_info suppresses the macro's generated one, so both the tools
-    // capability and our own name/version have to be restated here — otherwise
+    // capability and our own name/version have to be restated here â€” otherwise
     // no tools are advertised, and the server introduces itself to agents as
     // "rmcp" (the default is resolved inside that crate, not ours).
     fn get_info(&self) -> ServerInfo {
@@ -2603,7 +2783,7 @@ impl ServerHandler for BrainHandler {
 /// and the shared store (also used by the frontend `get_context` command).
 /// Bind a loopback endpoint dedicated to ONE session. Because only that session
 /// is registered against this port, every request on it is provably from that
-/// session — identity without a handshake.
+/// session â€” identity without a handshake.
 /// The caller owns the returned handle: dropping it does NOT stop the server, so
 /// it must be aborted explicitly when the session ends, or the listener outlives
 /// the session it was bound to.

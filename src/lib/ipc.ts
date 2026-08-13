@@ -94,7 +94,12 @@ export type ConductorTask = {
   // cancelled, and its result is still accepted.
   status: string;
   result: string;
+  // Stamped once at dispatch and never moved. This is not when the task
+  // finished — see done_ms.
   ts_ms: number;
+  // When the task reached a terminal state, or null while it is still live
+  // (including in_review and rework, neither of which is finished).
+  done_ms: number | null;
 };
 export type ConductorState = {
   conductor: string | null;
