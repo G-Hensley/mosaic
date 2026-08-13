@@ -83,6 +83,12 @@ export const setAgentBrain = (name: string, brain: string): Promise<void> =>
 export const setProject = (path: string | null): Promise<void> =>
   invoke("set_project", { path });
 
+export const projectIsRepo = (dir: string): Promise<boolean> =>
+  invoke("project_is_repo", { dir });
+
+export const initProjectRepo = (dir: string): Promise<void> =>
+  invoke("init_project_repo", { dir });
+
 // ---- Conductor ----
 export type ConductorTask = {
   id: string;

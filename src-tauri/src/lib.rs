@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
@@ -1020,6 +1021,26 @@ fn set_project(shared: State<'_, Arc<mcp::Shared>>, path: Option<String>) {
     shared.set_dir(dir);
 }
 
+#[tauri::command]
+fn project_is_repo(dir: String) -> bool {
+    worktree::repo_root(Path::new(&dir)).is_some()
+}
+
+#[tauri::command]
+fn init_project_repo(dir: String) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("init")
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| format!("failed to run git init in {dir}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("git init failed in {dir}: {detail}"))
+    }
+}
+
 /// Loopback URL + port of the in-process MCP server, for per-session registration.
 #[derive(Clone, Serialize)]
 struct McpInfo {
@@ -1287,6 +1308,21 @@ mod tests {
             !detail.retryable,
             "a directory will not become a repository by retrying"
         );
+    }
+
+    #[test]
+    fn project_repo_check_distinguishes_repo_from_plain_directory() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        worktree::init_test_repo(&repo).unwrap();
+
+        assert!(!super::project_is_repo(
+            plain.to_string_lossy().into_owned()
+        ));
+        assert!(super::project_is_repo(repo.to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -1695,6 +1731,8 @@ pub fn run() {
             set_conductor,
             halt_conductor,
             set_project,
+            project_is_repo,
+            init_project_repo,
             human_dispatch
         ])
         .on_window_event(|window, event| {

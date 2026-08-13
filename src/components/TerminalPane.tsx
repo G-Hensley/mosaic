@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
@@ -34,6 +34,10 @@ function spawnErrorText(e: unknown): string {
   return String(e);
 }
 
+function isIsolationUnavailable(e: unknown): boolean {
+  return Boolean(e && typeof e === "object" && "kind" in e && e.kind === "isolationUnavailable");
+}
+
 // One xterm terminal bound to one backend session. Owns the terminal lifecycle,
 // the output channel, keystroke write-back, container-driven resize, and live
 // re-theming when the app appearance changes.
@@ -43,12 +47,14 @@ export function TerminalPane({
   isolate,
   cwd,
   onExit,
+  onIsolationChange,
 }: {
   sessionId: string;
   type: SessionType;
   isolate?: boolean;
   cwd?: string;
   onExit: (id: string) => void;
+  onIsolationChange: (id: string, isolate: boolean) => void;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -57,6 +63,8 @@ export function TerminalPane({
   const scheduleFitRef = useRef<() => void>(() => {});
   const lastSizeRef = useRef({ rows: 0, cols: 0 });
   const { theme, appearance } = useAppearance();
+  const [isolationError, setIsolationError] = useState<string | null>(null);
+  const continueWithoutIsolationRef = useRef<() => void>(() => {});
 
   // Create the terminal once for this pane.
   useEffect(() => {
@@ -179,10 +187,22 @@ export function TerminalPane({
     if (isolate) {
       term.write("\x1b[38;5;245m[mosaic] creating an isolated git worktree…\x1b[0m\r\n");
     }
-    spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
-      isolate,
-      cwd,
-    }).catch((e) => writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${spawnErrorText(e)}\x1b[0m\r\n`));
+    const start = (withIsolation: boolean) => {
+      setIsolationError(null);
+      spawnSession(sessionId, channel, type.program, type.args, term.rows, term.cols, {
+        isolate: withIsolation,
+        cwd,
+      }).catch((e) => {
+        const message = spawnErrorText(e);
+        writeAfterQueuedOutput(`\r\n\x1b[31m[spawn error] ${message}\x1b[0m\r\n`);
+        if (isIsolationUnavailable(e)) setIsolationError(message);
+      });
+    };
+    continueWithoutIsolationRef.current = () => {
+      onIsolationChange(sessionId, false);
+      start(false);
+    };
+    start(Boolean(isolate));
 
     const unlisten = listen<string>("session-exited", (ev) => {
       if (ev.payload === sessionId) {
@@ -200,6 +220,7 @@ export function TerminalPane({
       if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
       if (outputFrame !== null) cancelAnimationFrame(outputFrame);
       scheduleFitRef.current = () => {};
+      continueWithoutIsolationRef.current = () => {};
       unlisten.then((f) => f());
       term.dispose();
       termRef.current = null;
@@ -219,5 +240,17 @@ export function TerminalPane({
     scheduleFitRef.current();
   }, [theme.id, theme.xterm, appearance.fontSize, sessionId]);
 
-  return <div className="pane-term" ref={elRef} />;
+  return (
+    <div className="pane-term-wrap">
+      {isolationError && (
+        <div className="pane-spawn-error" role="alert">
+          <span>{isolationError}</span>
+          <button type="button" onClick={() => continueWithoutIsolationRef.current()}>
+            Continue without isolation
+          </button>
+        </div>
+      )}
+      <div className="pane-term" ref={elRef} />
+    </div>
+  );
 }

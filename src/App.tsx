@@ -175,6 +175,10 @@ function App() {
     setPanes((p) => p.map((x) => (x.id === id ? { ...x, status: "exited" } : x)));
   }
 
+  function setPaneIsolation(id: string, isolate: boolean) {
+    setPanes((p) => p.map((x) => (x.id === id ? { ...x, isolate } : x)));
+  }
+
   // Re-home a pane (and its agent) to a brain. The backend re-scopes on the
   // agent's next tool call.
   function assignBrain(paneId: string, brain: string) {
@@ -447,6 +451,7 @@ function App() {
                     isolate={p.isolate}
                     cwd={project ?? undefined}
                     onExit={markExited}
+                    onIsolationChange={setPaneIsolation}
                   />
                 </section>
               );
@@ -469,7 +474,11 @@ function App() {
       </div>
 
       {launcherOpen && (
-        <SessionLauncher onPick={addSession} onClose={() => setLauncherOpen(false)} />
+        <SessionLauncher
+          project={project}
+          onPick={addSession}
+          onClose={() => setLauncherOpen(false)}
+        />
       )}
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
       {layoutOpen && (
