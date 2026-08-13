@@ -31,8 +31,10 @@ function Toast({ task, onDismiss }: ToastProps) {
   if (!visible) return null;
 
   const isDone = task.status === "done";
-  const isError =
-    task.status === "error" || task.status === "timeout" || task.status === "cancelled";
+  // "overdue" is deliberately absent: the agent is still working and its
+  // result is still accepted, so showing it as a failure would tell the
+  // conductor to give up on work that is about to arrive.
+  const isError = task.status === "error" || task.status === "cancelled";
 
   return (
     <div
@@ -70,12 +72,10 @@ export function ToastContainer({
   tasks: ConductorTask[];
   onDismiss: (id: string) => void;
 }) {
+  // Terminal states only. An overdue task has not finished, so surfacing it
+  // here would announce a result that does not exist yet.
   const completedTasks = tasks.filter(
-    (t) =>
-      t.status === "done" ||
-      t.status === "error" ||
-      t.status === "timeout" ||
-      t.status === "cancelled"
+    (t) => t.status === "done" || t.status === "error" || t.status === "cancelled"
   );
 
   return (

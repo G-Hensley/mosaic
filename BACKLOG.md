@@ -1,0 +1,555 @@
+# Backlog
+
+Ideas are not commitments. Promote an item only once its trigger, ownership,
+security boundary, and validation method are understood.
+
+`IMPROVEMENT-AUDIT.md` holds findings from a point-in-time review of existing
+code. This file holds capabilities Mosaic does not have yet.
+
+---
+
+## Prior art: nobody has solved the OpenCode local-model timeout
+
+Checked before investing further. Short answer: it is a known, unfixed problem,
+and the one team that documented it in depth gave up and moved to hosted models.
+
+Note the repo moved: `sst/opencode` now redirects to `anomalyco/opencode`.
+
+| Issue | Substance | Status |
+|---|---|---|
+| [#29420](https://github.com/anomalyco/opencode/issues/29420) | Names the cause: the timeout mechanism used `AbortSignal.timeout()`, "which does not work correctly in Bun's runtime", so provider requests had no effective timeout. Proposes a stream watchdog with a **30s first-byte** and 120s idle timeout | **Closed as not planned** |
+| [#2974](https://github.com/anomalyco/opencode/issues/2974) | Config `timeout` "totally ignored" for local providers. The reporter used 900000, the same value I tried | Closed |
+| [#3708](https://github.com/anomalyco/opencode/issues/3708) | Timeouts persist on larger models despite config | Open |
+| [#20466](https://github.com/anomalyco/opencode/issues/20466) | "SSE read timed out" is thrown but the session retry never retries it | Open |
+| [#22132](https://github.com/anomalyco/opencode/issues/22132) | Our exact hang: local Ollama hangs while `/v1/chat/completions` works directly | Open, no root cause, no workaround |
+| [#18428](https://github.com/anomalyco/opencode/issues/18428) | Ollama takes 60-90s via OpenCode vs 3s direct; ~75s of OpenCode-side overhead suspected in streaming logic | **Closed as not planned** |
+
+The 30s first-byte figure in #29420 matches the observed abort exactly, and the
+broken `AbortSignal.timeout()` explains why provider `timeout` values have no
+effect: the binary calls `AbortSignal.timeout(V.timeout)`, which is the
+primitive that issue says does not work under Bun.
+
+An [independent write-up](https://zenn.dev/masafumi_heijo/articles/opencode-ollama-timeout-tui-hang)
+reached the same conclusion by a different route, including the distinction
+that matters here: timeouts took effect under `opencode run` but not in the
+interactive TUI. Their phrasing is worth keeping, since it describes most of
+today: *"added and effective are two different problems."* They abandoned local
+Ollama and standardised on Claude.
+
+**The only workaround anyone confirms** is a third-party plugin,
+[Mte90/opencode-auto-resume](https://github.com/Mte90/opencode-auto-resume),
+which auto-resumes on timeout or error and exposes `chunkTimeoutMs`
+(default 45000). Worth evaluating, but it resumes after a failure rather than
+preventing one; pre-warming avoids the failure altogether and needs no plugin.
+
+**What appears to be new signal:** no issue documents the TUI-versus-headless
+asymmetry. Everything upstream reports the hang without noticing that
+`opencode run` survives the same request. Measured here at 33.2s and 32.7s
+headless against 30.4s and 30.5s cancelled in a pane. That is worth filing
+upstream, since it localises the bug to the interactive path and is cheap for a
+maintainer to reproduce.
+
+## Dispatch headlessly (`opencode run`) instead of typing into the TUI
+
+The 30 second ceiling on local-model requests is **not** an OpenCode-wide
+limit. It belongs to the interactive session path only.
+
+Measured both ways against a deliberately cold 20 GB model, which needs about
+33s:
+
+| Path | Ollama request | Outcome |
+|---|---:|---|
+| Mosaic pane (interactive TUI) | 30.4s, 30.5s | **cancelled both times** |
+| `opencode run` (headless) | 33.2s, 32.7s | **completed both times** |
+
+Two headless runs comfortably exceeded the limit that kills every pane request.
+`BUN_CONFIG_HTTP_IDLE_TIMEOUT` made no difference and is not the cause; it was
+tested and refuted rather than assumed.
+
+Provider options cannot raise the pane ceiling either, and the compiled binary
+shows why: the fetch wrapper collects abort signals and calls
+`AbortSignal.any()`, which fires on the earliest. A signal is already attached
+upstream (`t.signal`) before `timeout` / `headerTimeout` / `chunkTimeout` are
+appended, so a longer value can never win.
+
+So Mosaic has an architectural option worth weighing. It currently drives agents
+by typing into an interactive CLI, which is what makes dispatch fragile in two
+separate ways already documented here: the 1024-byte head truncation and this
+30s ceiling. Running non-interactive work through `opencode run -m
+provider/model "..."` would sidestep both, and would make large local models
+usable, since laguna answers in 1.1s warm and only ever fails on a cold start it
+is not allowed to finish.
+
+The tradeoff is real and should not be waved away: the interactive pane is the
+product. A user watching an agent work in a terminal is the point of Mosaic, and
+a headless dispatch is invisible. A hybrid, where interactive panes stay as they
+are and dispatched tasks run headlessly against the same session, is the shape
+worth exploring, not a wholesale change.
+
+## Local models: pick one that survives a cold start
+
+Solved 2026-08-11, by measurement rather than tuning.
+
+OpenCode enforces a hard **30 second** budget on a request to a local model.
+It is not configurable: `timeout`, `headerTimeout` and `chunkTimeout` exist in
+OpenCode's schema under `provider.<name>.options`, but setting them changed
+nothing on the `/v1/chat/completions` path. Two requests either side of the
+config change took 30.4172622s and 30.5398321s, so the option is simply not
+honored there.
+
+Measured against that budget, with OpenCode's ~13.2k-token prompt:
+
+| Model | Size | Warm | Cold |
+|---|---:|---:|---:|
+| `lfm2.5:8b` | 5.6 GB | 9.6s | **13.9s** |
+| `laguna-xs-2.1` | 20 GB | 11.2s | **32.7s** |
+
+So a 20 GB model is 2.7 seconds too slow on a cold start, every time, and a
+5.6 GB one has 16 seconds of headroom. Nothing here is flaky: a large local
+model works until it idles out of memory, then fails deterministically on the
+next request. That is exactly the "sometimes just stops working" symptom.
+
+**Use small local models for OpenCode panes.** Large ones are viable only if
+they never go cold, which is a guarantee nothing currently makes.
+
+Supporting fixes already applied, both server-side because the client cannot be
+configured:
+
+- `OLLAMA_CONTEXT_LENGTH=32768`. The model's own context length is 262144;
+  Ollama sized the KV cache from it, predicted 27.1 GiB, and evicted the model
+  mid-session. Real usage was 1.2k-14k tokens. Note that `limit.context` in
+  `opencode.json` does **not** control this: it caps what OpenCode will build
+  into a prompt, not what Ollama allocates. Those are different things and
+  conflating them wasted an afternoon.
+- `OLLAMA_KEEP_ALIVE=30m`, up from the 5 minute default, so a thinking agent
+  does not idle its model out and then pay a cold start it cannot afford.
+
+Both are set in the user environment, but Windows only propagates that to
+processes started after a fresh login, so Ollama must be launched from a shell
+that already has them until you log out and back in.
+
+Remaining lever if a bigger local model is ever wanted: shrink the 13.2k-token
+prompt. Unverified whether disabling tools removes their definitions from the
+request or only blocks execution (see sst/opencode#1320); it needs measuring
+with a logging proxy, not assuming.
+
+## Liveness: tell a slow agent apart from a dead one
+
+Found while testing the overdue fix, and partly caused by it.
+
+Before, a task past the threshold flipped to "timeout" and its result was
+refused. That was wrong, and it is fixed. But the fix traded one failure for
+another: a task is now **never** terminal on its own. If the agent process dies,
+its task sits at "overdue" forever and the conductor waits on a result that can
+never arrive.
+
+Observed directly: three OpenCode panes, only two `opencode` processes alive,
+and the third pane's task stuck at "overdue" with `complete_task` never called.
+Nothing in Mosaic noticed the process was gone.
+
+That pane was running **Laguna XS 2.1 locally through Ollama**, not a hosted
+model, and the operator reports local models stopping like this is recurring
+rather than a one-off. So this is not an exotic edge case to design around
+loosely: on this machine it is the expected failure mode of an entire class of
+session, and the pane most likely to die silently is the one whose work is
+cheapest to hand out.
+
+Two consequences worth separating:
+
+- **Detection** is the item below: a dead pane's task must reach a terminal
+  state.
+- **Routing** belongs with model-aware dispatch: local panes are the wrong
+  target for long, unattended, or on-the-critical-path work, however cheap they
+  are. Cost is not the only axis; delivery probability is one too.
+
+"overdue" is honest about not knowing, which is better than a false "timeout".
+But Mosaic does know something it is not using: it spawned the process and can
+see whether it is still running.
+
+- Mark a task `abandoned` when its target session's process is gone. That is a
+  real terminal state, distinct from "cancelled" (deliberate) and from
+  "overdue" (still working).
+- Surface pane liveness in `list_sessions`, so a conductor does not dispatch
+  into a dead pane in the first place.
+
+Confirmed again 2026-08-12, in the shape that matters most. Two of five panes
+took a task at the start of a long session and never returned anything at all.
+Both were still listed by `list_sessions` as ordinary dispatch targets for the
+entire session, with nothing distinguishing them from the three panes doing
+real work. The conductor's only signal was the absence of a result, which is
+indistinguishable from slowness, so it kept the tasks open and eventually
+re-dispatched the same work to a pane that was answering. `list_sessions` is
+the natural place to fix this precisely because it is the call a conductor makes
+*before* choosing a target, and it is currently the one call that cannot be
+wrong in a useful way: it reports presence, and presence is not readiness.
+- Consider whether a dead pane's task should be re-dispatchable to another
+  session, and whether that should be automatic or offered.
+
+## `get_task_result` with no id outgrows its own response limit
+
+It returns every task ever dispatched. At 28 tasks that is already ~67k
+characters, which exceeds the tool response limit and fails outright, so the
+documented way to collect a fan-out breaks exactly when a workspace has been
+used for a while.
+
+Second data point, 2026-08-12: **39 tasks, 111,770 characters**, still growing
+roughly linearly at ~2.8k per task. The failure is worse than "it errors",
+because the harness spills the payload to a file and instructs the caller to
+read all of it back in chunks. So the documented collection path now costs more
+context than the results are worth, and a conductor that follows the tool's own
+advice burns its window on prompts it already sent. Every collection in that
+session had to fall back to polling ids one at a time, which is exactly what the
+tool description tells you not to do.
+
+Wants a default window: open tasks plus recently finished ones, with older
+history behind an explicit flag. Filtering by status would also let a conductor
+ask the question it actually has, which is "what am I still waiting on".
+
+## Dispatch loses whole 1 KiB chunks from the head of a long prompt
+
+**Measured, not guessed.** Three Codex dispatches arrived beginning mid-word.
+Locating the survival point in the original text and adding the wrapper that
+`dispatch_prompt` prepends gives the same answer twice:
+
+| Dispatch | target | payload | task chars lost | + prefix | total lost |
+|---|---|---:|---:|---:|---:|
+| OpenRouter guardrails | codex | - | 942 | 82 | **1024** |
+| OpenCode timeouts | codex | - | 942 | 82 | **1024** |
+| agent-toolkit review | **opencode** | 2645 | 1966 | 82 | **2048** |
+
+Two different prompts of different lengths, both losing exactly 1024 bytes from
+the head. That is a 1 KiB buffer, not a race and not contention, and it kills
+the earlier hypothesis that a concurrent fan-out was to blame.
+
+**Two corrections from a third measurement, 2026-08-12.**
+
+*It is not a fixed 1024 bytes.* A 2645-byte payload lost exactly 2048, which is
+two whole chunks. So the loss scales with size: every complete leading 1 KiB
+chunk is dropped and only the trailing partial chunk arrives. Check the arithmetic
+against all three rows: 2645 = 2x1024 + 597 survived; the codex rows lost one
+chunk each and kept their remainders. "Loses exactly 1024" was true of the sample,
+not of the mechanism, and a fix validated only against ~2 KiB prompts would look
+correct while still corrupting longer ones.
+
+*It is not codex-specific.* This row is an **opencode** pane. The entry below
+points at `submit_to`'s `PASTE_START`/`PASTE_END` framing as the place to look
+first, and that framing is codex-only, so it cannot be the whole cause.
+
+**The write path is not the cause either. Measured and refuted, 2026-08-12.**
+
+I concluded from the above that "whatever drops the chunks sits in the shared
+write path". That was wrong, and a chunking-and-pacing fix in `write_to` would
+have been a speculative change to code that is not broken.
+
+`src-tauri/tests/pty_truncation.rs` opens a PTY exactly as `spawn_session` does,
+writes offset-labelled payloads through the same `portable-pty` 0.9 master
+writer, and reads back what arrives:
+
+| requested | received | lost |
+|---:|---:|---:|
+| 512 | 512 | 0 |
+| 1024 | 1024 | 0 |
+| 2048 | 2048 | 0 |
+| 4096 | 4096 | 0 |
+| 8192 | 8192 | 0 |
+| 65536 | 65536 | 0 |
+
+Zero loss through 64 KiB, and a second case writes 64 KiB while the child is
+deliberately not draining for a second: still zero. A single `write_all`
+returns `Ok` and every byte arrives. Supporting reads: portable-pty's
+`take_writer` hands back the ConPTY stdin pipe's descriptor with no buffering of
+its own, and `filedescriptor` calls synchronous `WriteFile` and reports the real
+byte count, which `write_all` loops on.
+
+So Mosaic's one-call write, portable-pty's writer, the ConPTY input buffer, and
+a child that is not yet reading are all eliminated as causes.
+
+**What is left** is the target application's own terminal input handling. The
+1 KiB replacement pattern fits a reader or editor that keeps only its most
+recent input batch. Note the harness drained with `cmd /c more`, which reads
+stdin as a stream; a TUI reading console input events is a different path
+entirely, and that difference is the next thing to test. The decisive
+reproduction spawns the real agent CLIs with deterministic startup and inspects
+the editor buffer before submission, comparing one write against paced chunks.
+
+**Fixed by bounding the payload, 2026-08-12.** `dispatch` now refuses any
+injection of 1024 bytes or more (`MAX_INJECTION_BYTES` in `src/mcp.rs`) instead
+of sending it and hoping. The mechanism drops *complete* leading chunks only, so
+an injection under one chunk has no complete leading chunk and cannot lose a
+byte. That is a guarantee rather than a mitigation, and it does not depend on
+ever finding the cause.
+
+The refusal carries the move, not just the verdict: how many bytes over, and
+that the fix is to split the task or point the agent at a file. It runs before
+the dispatch budget is charged and before the task is recorded, so a refused
+dispatch leaves no phantom `pending` id to poll.
+
+The cost is real and is the reason to keep looking for the cause: the wrapper
+takes 82 bytes of header and 111 of completion contract, leaving about **830
+bytes of brief**. Raising that limit is what fixing this entry buys.
+
+*An approach that did not work, recorded so it is not retried.* The first
+attempt appended an integrity footer to the prompt: its own length and opening
+quoted back, for the agent to check. Two flaws, both found by its own tests. The
+surviving tail is `len % 1024` bytes, which can be a handful, so no footer of
+any length is guaranteed to arrive; and asking a model to verify a character
+count is asking it to do the one thing it is worst at. Delegating delivery
+integrity to the receiver cannot work when delivery is what is broken.
+
+The same session lost three dispatches to the same opencode pane this way. Each
+time the agent noticed and said so, which is luck: it answered the questions it
+received and never knew the earlier ones existed. Two of three reviews came back
+half-answered for this reason, and the missing half contained a real bug when it
+was finally asked in a shorter prompt.
+
+Short dispatches are unaffected, which is the constraint that makes this
+interesting: if the first 1024 bytes were always dropped, a 200-byte dispatch
+would arrive empty, and those work fine. So the loss appears only once the
+payload exceeds one chunk. A chunked writer whose first chunk is overwritten,
+or lost to a redraw before the target's input is ready, fits the evidence.
+`submit_to` frames Codex payloads with `PASTE_START`/`PASTE_END`, so the codex
+path is the one to inspect first.
+
+**A correction worth keeping.** An earlier entry here claimed a length-matched
+test arrived intact and concluded this was not length-related. That test only
+asked the agent to echo the *final* words and an end token, so it could not have
+detected head truncation and almost certainly lost its own first 1024 bytes into
+the filler. Testing only the end of a message cannot prove the beginning
+arrived.
+
+Silent corruption is worse than a failed dispatch: the agent does competent work
+on the wrong brief, and in two of three cases said so only because it happened
+to notice. Dispatch should verify what landed, or fail loudly.
+
+Distinct from the submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the
+Enter rather than the text.
+
+## The limit, checked against the dispatches that had already gone silent
+
+Three review dispatches from 2026-08-13, measured after the fact against the
+1024-byte rule:
+
+| task | injection | would lose | outcome |
+|---|---:|---:|---|
+| sess-2, `mcp.rs` review | 967 B | 0 | **done**, 2161-char result |
+| sess-3, auth review | 975 B | 0 | pending at 30m |
+| sess-5, auth review | 2366 B | **2048** | pending at 341m |
+
+The sess-5 dispatch lost two whole chunks and arrived as roughly 318 bytes of
+tail. It was never going to come back, and the pane was not at fault: it was
+handed a fragment. That dispatch is exactly what `MAX_INJECTION_BYTES` now
+refuses, so the case the limit was built for had already happened and had
+already been misread as a slow agent.
+
+Worth stating plainly because the wrong lesson was available and tempting: for
+five hours the visible evidence was "opencode panes do not finish reviews".
+Two of the three panes were fine. The conductor was sending briefs that could
+not arrive.
+
+**What it does not explain.** The sess-3 dispatch fits in one chunk, arrived
+whole, and still produced nothing after 30 minutes while its pane stayed live.
+That is a genuinely slow or stuck agent, and it is the case `#22` and the
+`wait_for_tasks` entry below are about. Two different failures wearing the same
+symptom, `status: pending` forever, is the reason both need fixing: without a
+size guarantee there is no way to tell them apart, and every silent pane looks
+like a bad model.
+
+**Consequence for routing.** Until a stuck pane can be told from a slow one,
+the only honest signal is demonstrated completion. sess-2 has returned
+substantive reviews twice; the auth review was re-dispatched there rather than
+retried on a pane that had already gone quiet. That is a workaround, not
+routing, and it is what `#24` should replace.
+
+## A conductor cannot wait for a dispatch, only re-ask whether it landed
+
+`get_task_result` is a poll. There is no call that blocks until a task
+finishes, and no notification when one does. So a conductor that dispatches
+work and has nothing else queued has exactly two options: guess an interval and
+poll, or say "I'll report when it lands" and then never actually look again.
+
+The second is what kept happening, and it is worse than it sounds, because the
+sentence reads like a commitment. The conductor is not lying; it has no
+mechanism behind the promise. Observed directly on 2026-08-13: a review was
+dispatched to sess-2, reported as "still pending", and the turn ended. The
+review had in fact completed. The only reason it was ever read is that the user
+asked why nothing was waiting on it.
+
+The workaround that does work, and what it shows: the task store is append-only
+JSONL at `<project>/.mosaic/context/brain.jsonl`, so a shell loop can poll the
+last record for a task id until its status leaves `pending`, and the harness
+notifies on exit. That works, and needing to reach around the MCP server into
+its own storage to find out whether a task finished is the argument for putting
+it in the server.
+
+**The shape to aim for.** A `wait_for_tasks` call that blocks until given task
+ids reach a terminal status or a timeout expires, returning the same payload
+`get_task_result` would. Blocking is the point: it collapses "dispatch, guess,
+poll, guess again" into one call, and it makes "I'll report when it lands" a
+thing the conductor can actually do.
+
+Worth settling before building: a maximum wait, since a hung pane must not hold
+a conductor forever, and it should interact with the overdue threshold rather
+than duplicate it; whether it returns on the first completion or all of them,
+with first being more useful for a fan-out where any result unblocks the next
+step; and whether the timeout return is distinguishable from completion, which
+it must be, or the conductor cannot tell "finished" from "gave up waiting".
+
+Related: the roster's busy and OVERDUE markers already tell a conductor a pane
+is slow. This is the other half, letting it act on that without spinning.
+
+## Nothing enforces cross-model review, so "done" means self-certified
+
+The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
+you commit") lays out six steps: implement, route to a **different-model**
+reviewer, reviewer reports findings, implementer fixes and asks for a recheck,
+reviewer approves, then commit. It names the areas where this is never
+optional: `mcp.rs`, `worktree.rs`, session identity, dispatch, anything in
+`SECURITY.md`. `.github/pull_request_template.md` carries the matching
+checklist, including "Reviewer: model and session, different from the
+implementer".
+
+**Nothing in Mosaic implements any of it.** `complete_task` takes a result
+string, writes `status = "done"`, and that is the end of the task's life. There
+is no reviewer field, no review state between pending and done, and no way for
+the conductor to ask "who checked this?" because the answer was never recorded.
+The workspace is built out of different models sitting side by side, which is
+exactly the thing that makes cross-model review cheap, and it is the one thing
+the task model does not represent.
+
+So the policy holds only as long as a conductor remembers it, which is the
+failure mode of every convention that lives in a document and nowhere else.
+
+**Evidence, from this session.** Commit `ba2fc87` changes `mcp.rs` and the
+dispatch path — two of the areas `CONTRIBUTING.md` says *always* require a
+cross-model review. It was implemented, tested, committed and pushed by one
+model with no reviewer. Not because the rule was rejected, but because nothing
+asked. The review was dispatched to sess-2 only after the user asked which item
+owned this, which is the wrong order and the point of the entry.
+
+**The shape to aim for.** `complete_task` moves a task to a `review` state
+rather than `done`, naming a reviewer session that is not the implementer and
+not the conductor. Only a `review_task` call from that session closes it, with
+a verdict and findings recorded on the task. `get_task_result` then reports
+"done, reviewed by sess-2" or "awaiting review", so a conductor cannot mistake
+one for the other, and the roster shows review debt the way it now shows busy
+panes.
+
+Open questions worth settling before building: whether the conductor may waive
+review for trivial work (a typo fix should not need a round trip) and how that
+waiver is recorded; whether a rejected review reopens the original task or
+creates a linked one; and how this relates to the board sketch in
+`IMPROVEMENT-AUDIT.md`, whose `Review` column is the same idea with a UI
+attached. The task-model change is the load-bearing half and does not need the
+board to be useful.
+
+Related: `IMPROVEMENT-AUDIT.md`'s task-board sketch (explicitly marked "the
+design is still open") is the only other place this appears, and it is a
+drawing rather than a plan.
+
+## Model-aware dispatch
+
+Today the conductor knows a session's id and CLI (`sess-3 (opencode)`) and
+nothing about what that session is *good at*. So routing is guesswork, and the
+guesses have been wrong in practice: broad web research kept going to OpenCode
+sessions on a free-tier model, which is close to the worst available match for
+it.
+
+`Projects/knowledge/ai-kbase/MODEL-GUIDE.md` already contains the missing
+knowledge, maintained and dated, including a task-to-model routing table, per
+CLI strengths, cost and quota strategy, and the OpenRouter free pool.
+
+**The shape to aim for:** the conductor learns each pane's model and a short
+capability profile, so `list_sessions` answers "who should do this" rather than
+only "who is here".
+
+Open questions before building:
+
+- **Do not vendor a copy.** A snapshot of `MODEL-GUIDE.md` inside Mosaic is
+  stale the day it is written, and the guide already carries `last_verified`
+  and a 14-day cadence. Read it from a configured path, or import it through
+  the agent-toolkit catalog, rather than duplicating it.
+- The guide's routing table is human-shaped prose. Deciding what a
+  machine-readable profile needs (strengths, context window, cost tier, tool
+  support, latency expectation) is most of the work.
+- What happens when the guide is absent, since not every machine will have it.
+  Degrade to today's behaviour rather than failing.
+
+## Orchestrator may open the sessions the work needs
+
+Currently the human opens panes with Ctrl+K and the conductor dispatches to
+whatever exists. The conductor can see that a task wants a different model and
+can do nothing about it.
+
+Worth exploring: let the conductor request a new session of a named kind, so a
+plan that needs a second opinion from a different vendor can arrange one.
+
+This is a privilege escalation and needs treating as such:
+
+- Spawning a session starts a real process, may create a git worktree, and
+  consumes quota. `MAX_DISPATCHES` exists for a reason; an equivalent ceiling
+  is needed here.
+- Decide whether it is a request the human approves or an autonomous action.
+  Approval by default is the safer starting point.
+- A conductor that can create sessions can create them in a loop. Bound it
+  structurally, the way dispatch depth is already bounded by only the conductor
+  being able to dispatch.
+- Interaction with `SESSION-RESTORE-PROPOSAL.md`: restored panes and
+  conductor-created panes should not fight over ids.
+
+## Guardrail: OpenCode sessions must stay on free OpenRouter models
+
+OpenRouter is configured with a real account, so an OpenCode pane can select a
+paid model and silently spend money. Nothing in Mosaic currently constrains
+this, and the conductor cannot see what a pane costs.
+
+The naive implementation is wrong in a specific way worth writing down:
+
+**Do not detect "free" by checking that prompt and completion pricing are
+zero.** `MODEL-GUIDE.md` records that a model can price prompt and completion at
+zero while still charging per request, per generated image, or per audio clip.
+The documented signal is the `:free` suffix on the model id, plus the
+`openrouter/free` meta-id which selects from the live free pool.
+
+Also account for:
+
+- **Free quota is account-wide**, not per session: 20 requests/minute, and 50
+  requests/day until $10 of lifetime credit has been purchased, 1,000/day after.
+  A fan-out across several OpenCode panes shares one budget and can exhaust the
+  daily allowance quickly. An orchestrator that spawns sessions needs to know
+  this before it spawns them.
+- **`openrouter/free` does not promise a stable model identity.** It selects a
+  compatible model per request, so two calls can land on different models. Pin
+  an explicit `:free` id where reproducibility matters.
+- **Free is explicitly not a reliability tier.** The guide notes free
+  availability and latency vary. This is almost certainly why dispatches to
+  OpenCode panes ran long often enough to expose the discarded-result bug fixed
+  in `fix/late-task-completion`; the two issues share a root cause in tier
+  choice.
+- **It is still hosted inference.** Free does not mean private. Do not route
+  work over private code or credentials to this tier without checking the
+  selected provider's data policy.
+
+Enforcement point is undecided and matters: Mosaic can only realistically
+constrain what it launches, so this may belong in OpenCode's own config
+(generated from `.agents/`, per the toolkit's sync) rather than in Mosaic. If
+Mosaic enforces it, it needs a way to observe the model actually in use, which
+it does not have today.
+
+**Partly done, 2026-08-11.** `~/.config/opencode/opencode.json` now pins both
+`model` and `small_model` to `openrouter/openrouter/free`, the Free Models
+Router, with `max_price` zeros and `allow_fallbacks: false`.
+
+The router is a better guard than pinning one `:free` model, for a reason worth
+keeping: it cannot drift to a paid model, and it survives a model leaving the
+free pool. That is not hypothetical, `inclusionai/ling-3.0-flash:free` had
+already disappeared between the MODEL-GUIDE snapshot and the live catalogue.
+Its tradeoff is no stable model identity between requests.
+
+Care is needed with the sibling routers. `openrouter/free` prices prompt and
+completion at 0, but `openrouter/auto`, `openrouter/fusion`, and
+`openrouter/pareto-code` all report `-1`, meaning variable and billable. Pinning
+the wrong router looks equally tidy and spends money.
+
+Still outstanding, and still the only real guarantee: the account-side state
+(zero balance, auto top-up off, payment method removed, no BYOK keys). Config
+is declared intent; the balance is the enforcement.

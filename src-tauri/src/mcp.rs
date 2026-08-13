@@ -22,13 +22,68 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+/// The largest injection that cannot lose a byte on the way to a pane.
+///
+/// Delivery drops every *complete* leading 1 KiB chunk and lands only the
+/// trailing partial one (measured; see BACKLOG.md). An injection strictly
+/// under one chunk has no complete leading chunk, so there is nothing for the
+/// mechanism to take. That is what makes this a guarantee rather than a
+/// mitigation, and it holds whatever turns out to be doing the chunking.
+///
+/// The real ceiling a conductor feels is lower: the wrapper costs 82 bytes of
+/// header (matching the measured prefix) and 111 of completion contract, so
+/// about **830 bytes of brief** get through. That is tight, and deliberately
+/// so — a brief that does not fit is one that should have been split or put in
+/// a file. Once the chunking is found and fixed this constant is the single
+/// place to raise.
+const MAX_INJECTION_BYTES: usize = 1024;
+
+/// How far an injection exceeds what can be delivered intact, or `None` if it
+/// fits. Bytes, not chars: the truncation is a byte-buffer effect.
+fn injection_overage(injection: &str) -> Option<usize> {
+    let len = injection.len();
+    // `>=`, not `>`: at exactly 1024 there is one complete leading chunk, and
+    // it is the one that gets dropped.
+    (len >= MAX_INJECTION_BYTES).then(|| len - MAX_INJECTION_BYTES + 1)
+}
+
+/// The refusal for a brief too long to deliver whole, or `None` to proceed.
+///
+/// A free function for the same reason `dispatch_precheck` is one: `Shared`
+/// needs a Tauri `AppHandle` and cannot be built in a unit test, so policy
+/// that lives inside a method is policy nothing can assert on.
+///
+/// The message has to give the conductor the move, not just the verdict. It is
+/// read by a model deciding what to do next, and "too long" alone invites a
+/// retry of the same brief.
+fn oversize_refusal(injection: &str) -> Option<String> {
+    injection_overage(injection).map(|over| {
+        format!(
+            // "a {MAX} byte limit" read as though 1024 were allowed. It is the
+            // refusal threshold, so the largest that goes through is one less.
+            "brief is {over} bytes too long to deliver intact ({} bytes; the most that \
+             can be delivered is {}). Longer briefs reach the agent with the beginning \
+             silently missing. Split this into smaller tasks, or shorten it and point \
+             the agent at a file for the detail.",
+            injection.len(),
+            MAX_INJECTION_BYTES - 1
+        )
+    })
+}
+
 fn dispatch_prompt(conductor: &str, task_id: &str, task: &str) -> String {
     // Keep the injection on one terminal line. Embedded CR/LF characters can
     // become unintended submit events in a target CLI. Preserve all other
     // whitespace because quoted commands and code fragments may depend on it.
     let task = task.replace("\r\n", " ").replace(['\r', '\n'], " ");
+
+    // Deliberately lean. Every byte spent here is a byte the brief cannot
+    // have before `MAX_INJECTION_BYTES` refuses the dispatch, so anything the
+    // agent can learn from an MCP tool call does not belong in the terminal.
     format!(
-        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} When finished, call the mosaic complete_task tool with task_id \"{task_id}\" and your result."
+        "[mosaic] Task from conductor '{conductor}' (task_id {task_id}): {task} \
+         When done, call the mosaic complete_task tool with task_id \"{task_id}\" \
+         and your result."
     )
 }
 
@@ -99,7 +154,8 @@ pub struct Task {
     pub from: String,
     pub target: String,
     pub task: String,
-    /// "pending" | "done" | "timeout" | "cancelled" | "error"
+    /// "pending" | "overdue" | "done" | "cancelled" | "error".
+    /// "overdue" is non-terminal: still running, result still accepted.
     pub status: String,
     pub result: String,
     pub ts_ms: u64,
@@ -162,13 +218,24 @@ fn append_record(dir: &Path, record: &StoreRecord) -> std::io::Result<()> {
 /// Guardrails. Note that depth is bounded structurally: only the conductor may
 /// dispatch, so a dispatched agent cannot dispatch onward.
 const MAX_DISPATCHES: u32 = 40;
-const TASK_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+
+/// How long before a still-running task is reported as "overdue".
+///
+/// This is a reporting threshold, not a deadline. Nothing here cancels an
+/// agent: the dispatched CLI keeps working, and its `complete_task` call is
+/// still accepted afterwards. Crossing this line only changes what the
+/// conductor is told, so that a slow task is visible without its result being
+/// thrown away.
+///
+/// Twenty minutes because real dispatched work routinely runs past ten. A
+/// threshold most tasks trip is noise, and noise gets ignored.
+const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 
 /// A task record was created and delivery was attempted. `delivered` is false
 /// when the prompt could not be written to the target's terminal — the task
 /// still exists, in "error" status, rather than vanishing silently the way a
 /// failed dispatch used to.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DispatchOutcome {
     pub task_id: String,
     pub delivered: bool,
@@ -188,6 +255,7 @@ fn dispatch_precheck(
     from: &str,
     target: &str,
     target_is_live: bool,
+    injection: &str,
 ) -> Result<(), String> {
     if halted {
         return Err("dispatch is halted by the user (Stop). Do not retry.".to_string());
@@ -200,12 +268,63 @@ fn dispatch_precheck(
             "no live session '{target}'. Call list_sessions for valid targets."
         ));
     }
+    // Last, so a conductor that got the target wrong hears about the target.
+    // Both errors are actionable, but only one of them is about the thing the
+    // conductor just typed.
+    if let Some(refusal) = oversize_refusal(injection) {
+        return Err(refusal);
+    }
     Ok(())
+}
+
+/// How `Shared` tells the UI something changed.
+///
+/// A seam, for one reason: `Shared` used to hold an `AppHandle` directly, and
+/// an `AppHandle` cannot be built outside a running app. That made every policy
+/// living on a `Shared` method unreachable from a test, so it could only be
+/// verified by reading the code — which is exactly how the dispatch gate's
+/// ordering went untested until a reviewer asked.
+///
+/// `tauri::test::mock_app()` is the other way to solve this, but its handle is
+/// `AppHandle<MockRuntime>`, so taking it means making `Shared` generic over the
+/// runtime and threading that parameter through every caller. This is smaller
+/// and the emissions are fire-and-forget anyway.
+/// A closure rather than an `AppHandle` variant, and that detail is the whole
+/// point. Holding an `AppHandle` anywhere in `Shared`'s type graph makes the
+/// compiler instantiate `AppHandle<Wry>`'s drop glue for any test that builds a
+/// `Shared`, which drags Wry's runtime into the test binary and fails it at
+/// *load* time with `STATUS_ENTRYPOINT_NOT_FOUND` — before a single test runs,
+/// with no hint as to the cause. Erasing the handle behind `dyn Fn` keeps it
+/// out of `Shared` entirely.
+/// Named so the `Notifier` field stays readable; clippy flags the raw form as
+/// a very complex type.
+type EmitFn = Box<dyn Fn(&str) + Send + Sync>;
+
+pub struct Notifier(Option<EmitFn>);
+
+impl Notifier {
+    pub fn to_app(app: AppHandle) -> Self {
+        Notifier(Some(Box::new(move |event| {
+            let _ = app.emit(event, ());
+        })))
+    }
+
+    /// Drops events. Tests assert on state, not on notifications.
+    #[cfg(test)]
+    pub fn silent() -> Self {
+        Notifier(None)
+    }
+
+    fn emit(&self, event: &str) {
+        if let Some(send) = &self.0 {
+            send(event);
+        }
+    }
 }
 
 /// The shared store — one instance, cloned by Arc into every agent's handler.
 pub struct Shared {
-    app: AppHandle,
+    app: Notifier,
     /// Where entries are mirrored as markdown. Follows the picked project, so it
     /// changes at runtime rather than being fixed at startup.
     dir: Mutex<PathBuf>,
@@ -238,8 +357,8 @@ impl Shared {
         *self.entries.lock().unwrap() = brain.entries;
         *self.sessions.lock().unwrap() = brain.sessions;
         *self.tasks.lock().unwrap() = brain.tasks;
-        let _ = self.app.emit("context-changed", ());
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("context-changed");
+        self.app.emit("conductor-changed");
     }
 
     /// The brain a given agent name is currently in. Defaults to "main".
@@ -260,7 +379,7 @@ impl Shared {
             .lock()
             .unwrap()
             .insert(name.to_string(), room.to_string());
-        let _ = self.app.emit("context-changed", ());
+        self.app.emit("context-changed");
         Ok(())
     }
 
@@ -286,7 +405,7 @@ impl Shared {
         let _ = append_line(&file, &format!("- **{topic}** ({author}): {body}\n"));
         let _ = append_record(&dir, &StoreRecord::Entry(entry.clone()));
         self.entries.lock().unwrap().push(entry);
-        let _ = self.app.emit("context-changed", ());
+        self.app.emit("context-changed");
     }
 
     pub fn entries_snapshot(&self) -> Vec<Entry> {
@@ -311,7 +430,7 @@ impl Shared {
             s.push(session);
         }
         drop(s);
-        let _ = self.app.emit("context-changed", ());
+        self.app.emit("context-changed");
     }
 
     // ---- conductor ----
@@ -327,6 +446,19 @@ impl Shared {
     pub fn roster_lines(&self) -> Vec<String> {
         let identified = self.sessions_snapshot();
         let conductor = self.conductor();
+        let now = Self::now_ms();
+        // Presence is not readiness. A pane that took a task and went quiet is
+        // listed exactly like an idle one, so a conductor picks it again and
+        // waits on a result that is not coming. The open task and its age are
+        // the cheapest honest signal available here.
+        let open_for: Vec<(String, u64)> = {
+            let tasks = self.tasks.lock().unwrap();
+            tasks
+                .iter()
+                .filter(|t| is_open(&t.status))
+                .map(|t| (t.target.clone(), now.saturating_sub(t.ts_ms)))
+                .collect()
+        };
         let mut ids = self.engine.ids();
         ids.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         ids.iter()
@@ -342,7 +474,14 @@ impl Shared {
                 } else {
                     ""
                 };
-                format!("- {id} ({kind}) brain={room}{role}")
+                // The oldest open task, because that is the one most likely to
+                // be stuck and the one worth warning about.
+                let busy = open_for
+                    .iter()
+                    .filter(|(target, _)| target == id)
+                    .map(|(_, age_ms)| *age_ms)
+                    .max();
+                format!("- {id} ({kind}) brain={room}{role}{}", busy_label(busy))
             })
             .collect()
     }
@@ -367,7 +506,7 @@ impl Shared {
     /// Dispatch still submits, because there no human is at the keyboard.
     pub fn set_conductor(&self, name: Option<String>) {
         *self.conductor.lock().unwrap() = name.clone();
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("conductor-changed");
 
         let Some(target) = name else { return };
         // A Shell pane has no MCP connection, so it cannot dispatch and the
@@ -411,7 +550,7 @@ impl Shared {
         } else {
             *self.dispatches.lock().unwrap() = 0;
         }
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("conductor-changed");
     }
 
     pub fn is_halted(&self) -> bool {
@@ -436,7 +575,7 @@ impl Shared {
         let dir = self.dir.lock().unwrap().clone();
         let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
         self.tasks.lock().unwrap().push(t);
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("conductor-changed");
     }
 
     fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<(), TaskAccessError> {
@@ -453,7 +592,7 @@ impl Shared {
                 let dir = self.dir.lock().unwrap().clone();
                 let _ = append_record(&dir, &StoreRecord::Task(task));
             }
-            let _ = self.app.emit("conductor-changed", ());
+            self.app.emit("conductor-changed");
         }
         found
     }
@@ -474,11 +613,11 @@ impl Shared {
                 let dir = self.dir.lock().unwrap().clone();
                 let _ = append_record(&dir, &StoreRecord::Task(task));
             }
-            let _ = self.app.emit("conductor-changed", ());
+            self.app.emit("conductor-changed");
         }
     }
 
-    /// Look a task up, flipping it to "timeout" if it has aged out.
+    /// Look a task up, flipping it to "overdue" if it has aged out.
     fn task_status(&self, caller: &str, id: &str) -> Result<Task, TaskAccessError> {
         let mut tasks = self.tasks.lock().unwrap();
         let now = Self::now_ms();
@@ -538,12 +677,20 @@ impl Shared {
         task: &str,
     ) -> Result<DispatchOutcome, String> {
         let target_is_live = self.engine.ids().iter().any(|i| i == target);
-        dispatch_precheck(self.is_halted(), from, target, target_is_live)?;
+
+        // Built before the gate because the size rule needs the finished
+        // injection, and the id is part of what it measures. Nothing here
+        // mutates: every refusal below still costs no budget and records no
+        // task, which `a_refused_dispatch_charges_nothing_and_records_nothing`
+        // holds us to.
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let injection = dispatch_prompt(from, &id, task);
+        dispatch_precheck(self.is_halted(), from, target, target_is_live, &injection)?;
+
         if !self.take_dispatch_budget() {
             return Err("dispatch budget exhausted for this run.".to_string());
         }
 
-        let id = uuid::Uuid::new_v4().simple().to_string();
         self.add_task(Task {
             id: id.clone(),
             from: from.to_string(),
@@ -558,7 +705,6 @@ impl Shared {
         // instruction. Submit Enter separately: Codex and Claude Code treat
         // text+CR in one PTY write as a paste and can leave it waiting in the
         // input editor — see `SessionManager::submit_to`.
-        let injection = dispatch_prompt(from, &id, task);
         let delivered = self.engine.submit_to(target, &injection);
         if !delivered {
             self.mark_delivery_failed(&id);
@@ -570,18 +716,61 @@ impl Shared {
     }
 }
 
-/// Age a single task in place: still-pending past the timeout becomes
-/// "timeout". Shared by `task_status` (one id) and `tasks_from` (a whole
+/// Age a single task in place: still-pending past the threshold becomes
+/// "overdue". Shared by `task_status` (one id) and `tasks_from` (a whole
 /// list), which used to duplicate this check inline.
-fn age(t: &mut Task, now: u64) {
-    if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_TIMEOUT_MS {
-        t.status = "timeout".to_string();
+///
+/// "overdue" is deliberately not terminal. The agent is still running and its
+/// result is still accepted, so this only marks the task as slow.
+/// What to append to a roster line for a pane's oldest open task.
+///
+/// Past the overdue threshold the wording changes deliberately. "busy 45m" and
+/// "busy 45m, OVERDUE, may be stuck" are the same fact, but only the second
+/// tells a conductor to stop waiting and consider another target. A pane that
+/// took a task and went silent was previously indistinguishable from an idle
+/// one, and got picked again.
+fn busy_label(oldest_open_ms: Option<u64>) -> String {
+    match oldest_open_ms {
+        None => String::new(),
+        Some(ms) if ms > TASK_OVERDUE_MS => {
+            format!(" [busy {}, OVERDUE, may be stuck]", human_ms(ms))
+        }
+        Some(ms) => format!(" [busy {}]", human_ms(ms)),
     }
 }
 
-/// The core of `finish_task`: flip a task from "pending" to "done", but only
-/// if it is still pending. Pure over a task list, with no lock or emit, so the
-/// state transition can be tested directly.
+/// A duration a human reads at a glance. Roster lines are scanned, not parsed.
+fn human_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    format!("{}h{:02}m", mins / 60, mins % 60)
+}
+
+fn age(t: &mut Task, now: u64) {
+    if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_OVERDUE_MS {
+        t.status = "overdue".to_string();
+    }
+}
+
+/// States a dispatched agent may still report a result from.
+///
+/// "overdue" belongs here and its absence was a real bug: a task that aged out
+/// could never be completed, so an agent that did the whole job came back to
+/// report and was refused, and the work was discarded. Nothing ever cancelled
+/// that agent, so the wall clock alone decided the result was worthless.
+fn accepts_result(status: &str) -> bool {
+    matches!(status, "pending" | "overdue")
+}
+
+/// The core of `finish_task`: flip a task to "done" if it is still awaiting a
+/// result. Pure over a task list, with no lock or emit, so the state
+/// transition can be tested directly.
 #[derive(Debug, PartialEq)]
 enum TaskAccessError {
     NotFound,
@@ -597,7 +786,9 @@ fn finish_pending(
 ) -> Result<(), TaskAccessError> {
     match tasks.iter_mut().find(|t| t.id == id) {
         Some(t) if t.target != caller => Err(TaskAccessError::Forbidden),
-        Some(t) if t.status != "pending" => Err(TaskAccessError::NotPending),
+        // Genuinely terminal states still refuse: a cancelled task should not
+        // resurrect, and a completed one should not be silently rewritten.
+        Some(t) if !accepts_result(&t.status) => Err(TaskAccessError::NotPending),
         Some(t) => {
             t.status = "done".to_string();
             t.result = result.to_string();
@@ -661,6 +852,70 @@ fn render_task(t: &Task) -> String {
     } else {
         format!("[{}] {} → {}", t.status, t.target, t.task)
     }
+}
+
+/// How much of the original brief to echo back in a multi-task listing.
+const TASK_ECHO_CHARS: usize = 160;
+
+/// Terminal tasks kept in the default listing, newest first.
+const RECENT_FINISHED: usize = 10;
+
+fn is_open(status: &str) -> bool {
+    // "overdue" is explicitly still running, so it belongs with pending.
+    status == "pending" || status == "overdue"
+}
+
+fn truncate_chars(s: &str, limit: usize) -> String {
+    let mut out: String = s.chars().take(limit).collect();
+    if s.chars().nth(limit).is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+/// One task in a listing.
+///
+/// Deliberately does NOT echo the whole brief. The conductor wrote it and
+/// still has it; replaying every prompt back is what grew this response to
+/// 111k characters over 39 tasks, past the tool response limit, so the
+/// documented way to collect a fan-out failed exactly when a workspace had
+/// been used enough to need it. The result is kept whole, because that is the
+/// part the caller does not already have.
+fn render_task_summary(t: &Task) -> String {
+    let brief = truncate_chars(&t.task, TASK_ECHO_CHARS);
+    if t.status == "done" {
+        format!("[done] {} → {}\n{}", t.target, brief, t.result)
+    } else {
+        format!("[{}] {} → {}", t.status, t.target, brief)
+    }
+}
+
+/// The tasks a listing should show, and how many were held back.
+///
+/// Open tasks are never dropped: "what am I still waiting on" is the question
+/// this tool exists to answer, and truncating that would be worse than the
+/// size problem it fixes.
+fn select_tasks(mine: Vec<Task>, include_all: bool, status: &str) -> (Vec<Task>, usize) {
+    if !status.is_empty() {
+        let filtered: Vec<Task> = mine.into_iter().filter(|t| t.status == status).collect();
+        return (filtered, 0);
+    }
+    if include_all {
+        return (mine, 0);
+    }
+    let total = mine.len();
+    let (open, finished): (Vec<Task>, Vec<Task>) =
+        mine.into_iter().partition(|t| is_open(&t.status));
+    let kept_finished = finished.len().min(RECENT_FINISHED);
+    let dropped = finished.len() - kept_finished;
+    // Newest finished first, then re-joined after the open ones.
+    let mut recent: Vec<Task> = finished;
+    recent.sort_by_key(|t| std::cmp::Reverse(t.ts_ms));
+    recent.truncate(kept_finished);
+    let mut out = open;
+    out.extend(recent);
+    debug_assert!(out.len() + dropped == total);
+    (out, dropped)
 }
 
 fn append_line(path: &PathBuf, s: &str) -> std::io::Result<()> {
@@ -777,10 +1032,19 @@ pub struct CompleteArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskQuery {
-    /// A single task_id to check. Leave this out to get every task you have
-    /// dispatched, which is the efficient way to collect a parallel fan-out.
+    /// A single task_id to check. Leave this out to collect the fan-out you
+    /// are waiting on, which is the efficient way to gather parallel work.
     #[serde(default)]
     pub task_id: String,
+    /// Only tasks with this status: pending, overdue, done, error or
+    /// cancelled. Use "pending" or "overdue" to ask what is still running.
+    #[serde(default)]
+    pub status: String,
+    /// Include the whole dispatch history rather than open tasks plus the
+    /// most recent finished ones. Large workspaces can exceed the response
+    /// limit; prefer `status` when you want something specific.
+    #[serde(default)]
+    pub include_all: bool,
 }
 
 #[tool_router]
@@ -815,7 +1079,7 @@ impl BrainHandler {
                 return format!("Refused: {e}.");
             }
         }
-        let _ = self.shared.app.emit("context-changed", ());
+        self.shared.app.emit("context-changed");
         format!(
             "Identity set to '{}' in brain '{}'",
             p.name,
@@ -895,7 +1159,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their model/CLI and brain. Call this when you are planning work: if you are the conductor these are real, idle agents you can hand tasks to in parallel via dispatch."
+        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it."
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
@@ -970,12 +1234,15 @@ impl BrainHandler {
                 "Refused: this task is assigned to a different session.".to_string()
             }
             Err(TaskAccessError::NotFound) => format!("No task '{}'.", p.task_id),
-            Err(TaskAccessError::NotPending) => format!("Task '{}' is not pending.", p.task_id),
+            Err(TaskAccessError::NotPending) => format!(
+                "Task '{}' is already finished or was cancelled, so no result was recorded.",
+                p.task_id
+            ),
         }
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every task you dispatched at once — do that instead of polling ids one by one. Statuses are pending, done (with the result), timeout or cancelled."
+        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once — do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -997,18 +1264,39 @@ impl BrainHandler {
         if mine.is_empty() {
             return "You have not dispatched any tasks.".to_string();
         }
-        let pending = mine.iter().filter(|t| t.status == "pending").count();
-        let mut out = format!(
-            "# Your dispatched tasks ({} total, {} still running)\n",
-            mine.len(),
-            pending
-        );
-        for t in &mine {
+        let total = mine.len();
+        let running = mine.iter().filter(|t| is_open(&t.status)).count();
+        let (shown, dropped) = select_tasks(mine, p.include_all, &p.status);
+
+        if shown.is_empty() {
+            return format!(
+                "No tasks with status '{}'. {total} dispatched in all.",
+                p.status
+            );
+        }
+
+        let mut out = if p.status.is_empty() {
+            format!("# Your dispatched tasks ({total} total, {running} still running)\n")
+        } else {
+            format!(
+                "# Your dispatched tasks with status '{}' ({} of {total})\n",
+                p.status,
+                shown.len()
+            )
+        };
+        for t in &shown {
             out.push_str(&format!(
                 "\n## {} → {}\n{}\n",
                 t.id,
                 t.target,
-                render_task(t)
+                render_task_summary(t)
+            ));
+        }
+        if dropped > 0 {
+            out.push_str(&format!(
+                "\n{dropped} older finished task(s) not shown. Pass include_all for the \
+                 whole history, or status to filter. Briefs are abbreviated here; pass a \
+                 task_id for one task in full.\n"
             ));
         }
         out
@@ -1018,11 +1306,123 @@ impl BrainHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        age, append_record, bearer_matches, conductor_briefing, dispatch_precheck, dispatch_prompt,
-        finish_pending, load_brain, mark_pending_error, mint_session_token, render_task,
-        task_for_dispatcher, validate_path_component, AgentSession, Entry, StoreRecord, Task,
-        TaskAccessError, TASK_TIMEOUT_MS,
+        age, append_record, bearer_matches, busy_label, conductor_briefing, dispatch_precheck,
+        dispatch_prompt, finish_pending, human_ms, injection_overage, load_brain,
+        mark_pending_error, mint_session_token, oversize_refusal, render_task, render_task_summary,
+        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry, Notifier,
+        Shared, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS,
+        TASK_OVERDUE_MS,
     };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_free_pane_carries_no_busy_marker() {
+        assert_eq!(busy_label(None), "");
+    }
+
+    #[test]
+    fn a_pane_past_the_overdue_window_is_called_out_not_just_timed() {
+        // Both strings carry the same number. Only one tells a conductor to
+        // stop waiting, which is the whole point: a silent pane used to look
+        // exactly like an idle one and got dispatched to again.
+        let working = busy_label(Some(TASK_OVERDUE_MS - 1));
+        let stuck = busy_label(Some(TASK_OVERDUE_MS + 1));
+
+        assert!(working.contains("busy"));
+        assert!(!working.contains("OVERDUE"));
+        assert!(stuck.contains("OVERDUE"));
+        assert!(stuck.contains("may be stuck"));
+    }
+
+    #[test]
+    fn durations_read_at_a_glance() {
+        assert_eq!(human_ms(0), "0s");
+        assert_eq!(human_ms(45 * 1000), "45s");
+        assert_eq!(human_ms(90 * 1000), "1m");
+        assert_eq!(human_ms(45 * 60 * 1000), "45m");
+        assert_eq!(human_ms(3 * 60 * 60 * 1000 + 7 * 60 * 1000), "3h07m");
+    }
+
+    fn task_at(id: &str, status: &str, ts_ms: u64) -> Task {
+        Task {
+            id: id.into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: status.into(),
+            result: String::new(),
+            ts_ms,
+        }
+    }
+
+    #[test]
+    fn a_listing_never_drops_an_open_task() {
+        // "What am I still waiting on" is the question this tool exists to
+        // answer, so windowing must never cost an open task.
+        let mut tasks: Vec<Task> = (0..RECENT_FINISHED as u64 * 3)
+            .map(|i| task_at(&format!("done{i}"), "done", i))
+            .collect();
+        tasks.push(task_at("open1", "pending", 999));
+        tasks.push(task_at("open2", "overdue", 1000));
+
+        let (shown, dropped) = select_tasks(tasks, false, "");
+
+        let ids: Vec<&str> = shown.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"open1"), "pending task was dropped");
+        assert!(ids.contains(&"open2"), "overdue task was dropped");
+        assert_eq!(shown.len(), 2 + RECENT_FINISHED);
+        assert_eq!(dropped, RECENT_FINISHED * 3 - RECENT_FINISHED);
+    }
+
+    #[test]
+    fn a_listing_keeps_the_newest_finished_tasks() {
+        let tasks: Vec<Task> = (0..RECENT_FINISHED as u64 + 5)
+            .map(|i| task_at(&format!("t{i}"), "done", i))
+            .collect();
+
+        let (shown, dropped) = select_tasks(tasks, false, "");
+
+        assert_eq!(dropped, 5);
+        let oldest_kept = shown.iter().map(|t| t.ts_ms).min().unwrap();
+        assert_eq!(oldest_kept, 5, "kept the oldest instead of the newest");
+    }
+
+    #[test]
+    fn include_all_and_status_bypass_the_window() {
+        let tasks: Vec<Task> = (0..RECENT_FINISHED as u64 + 5)
+            .map(|i| task_at(&format!("t{i}"), "done", i))
+            .collect();
+        let total = tasks.len();
+
+        let (all, dropped) = select_tasks(tasks.clone(), true, "");
+        assert_eq!(all.len(), total);
+        assert_eq!(dropped, 0);
+
+        let (none, _) = select_tasks(tasks, false, "pending");
+        assert!(none.is_empty(), "status filter must not invent matches");
+    }
+
+    #[test]
+    fn a_listing_abbreviates_the_brief_but_never_the_result() {
+        // The conductor wrote the brief and still has it. Replaying every
+        // prompt is what pushed this response past the tool's size limit.
+        let long_brief = "b".repeat(TASK_ECHO_CHARS * 4);
+        let long_result = "r".repeat(4000);
+        let mut t = task_at("abc", "done", 0);
+        t.task = long_brief.clone();
+        t.result = long_result.clone();
+
+        let summary = render_task_summary(&t);
+
+        assert!(!summary.contains(&long_brief), "brief was echoed in full");
+        assert!(summary.contains("..."), "truncation was not marked");
+        assert!(summary.contains(&long_result), "result must survive whole");
+        assert!(
+            render_task(&t).contains(&long_brief),
+            "single lookup stays full"
+        );
+    }
 
     #[test]
     fn dispatch_prompt_is_single_line_and_includes_completion_contract() {
@@ -1031,6 +1431,135 @@ mod tests {
         assert!(!prompt.contains(['\r', '\n']));
         assert!(prompt.contains("audit this then report"));
         assert!(prompt.contains("task_id \"abc123\""));
+    }
+
+    #[test]
+    fn an_injection_within_the_limit_survives_the_observed_truncation() {
+        // The property the limit buys, stated as the corruption itself:
+        // replay the measured mechanism (every complete leading 1 KiB chunk is
+        // dropped, only the trailing partial chunk lands) and require the whole
+        // injection back. An earlier attempt put an integrity *footer* in the
+        // prompt instead; this test is what killed it. The surviving tail is
+        // `len % 1024` bytes, which can be a handful, so no footer of any
+        // length is guaranteed to arrive. Only staying under a chunk is.
+        let task = "x".repeat(800);
+        let prompt = dispatch_prompt("sess-1", "abc123", &task);
+        assert!(injection_overage(&prompt).is_none(), "fixture is too long");
+
+        let bytes = prompt.as_bytes();
+        let survived = &bytes[(bytes.len() / 1024) * 1024..];
+
+        assert_eq!(
+            String::from_utf8_lossy(survived),
+            prompt,
+            "an injection under one chunk must lose nothing"
+        );
+    }
+
+    #[test]
+    fn the_limit_bites_at_exactly_one_whole_chunk() {
+        // At 1024 there is one complete leading chunk and it is the one that
+        // gets dropped, so the boundary is `>=`. Asserted directly because an
+        // off-by-one here is invisible until a brief silently loses its head.
+        assert_eq!(injection_overage(&"x".repeat(1023)), None);
+        assert_eq!(injection_overage(&"x".repeat(1024)), Some(1));
+        assert_eq!(injection_overage(&"x".repeat(1030)), Some(7));
+    }
+
+    #[test]
+    fn the_gate_refuses_an_oversized_brief_but_reports_the_target_first() {
+        let long = dispatch_prompt("sess-1", "abc123", &"x".repeat(2000));
+
+        let err = dispatch_precheck(false, "sess-1", "sess-2", true, &long).unwrap_err();
+        assert!(err.contains("too long to deliver intact"), "{err}");
+
+        // Both are wrong here. The target is the one the conductor can act on
+        // without rewriting anything, so it wins.
+        let err = dispatch_precheck(false, "sess-1", "sess-2", false, &long).unwrap_err();
+        assert!(err.contains("no live session"), "{err}");
+    }
+
+    /// A `Shared` with no live sessions and a scratch store.
+    ///
+    /// Possible only because of the `Notifier` seam: `Shared` used to hold an
+    /// `AppHandle`, which cannot exist outside a running app, so every policy
+    /// on a `Shared` method could only be verified by reading it. The `TempDir`
+    /// is returned because dropping it would delete the store mid-test.
+    fn shared_for_test() -> (Arc<Shared>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = Arc::new(Shared {
+            app: Notifier::silent(),
+            dir: Mutex::new(dir.path().to_path_buf()),
+            entries: Mutex::new(Vec::new()),
+            sessions: Mutex::new(Vec::new()),
+            name_to_room: Mutex::new(HashMap::new()),
+            engine: Arc::new(crate::SessionManager::default()),
+            conductor: Mutex::new(Some("sess-1".to_string())),
+            halted: Mutex::new(false),
+            tasks: Mutex::new(Vec::new()),
+            dispatches: Mutex::new(0),
+        });
+        // `app` owns the runtime the handle points at, so it has to outlive the
+        // handle. Leaking it is cheaper than threading it through every caller
+        // and this is a test process that is about to exit.
+
+        (shared, dir)
+    }
+
+    #[test]
+    fn a_refused_dispatch_charges_nothing_and_records_nothing() {
+        // The property the whole gate rests on, and the one a reviewer caught
+        // as untested: refusal happens before *any* mutation. Move
+        // `dispatch_precheck` below `take_dispatch_budget` or `add_task` and
+        // this fails, while every pure test above stays green.
+        let (shared, _dir) = shared_for_test();
+
+        let err = shared
+            .dispatch_task("sess-1", "sess-2", "audit the parser")
+            .expect_err("no session is live in this fixture");
+        assert!(err.contains("no live session"), "{err}");
+
+        assert!(
+            shared.tasks_from("sess-1").is_empty(),
+            "a refused dispatch left a task the conductor can never collect"
+        );
+        assert_eq!(
+            *shared.dispatches.lock().unwrap(),
+            0,
+            "a refused dispatch charged the budget"
+        );
+    }
+
+    #[test]
+    fn a_realistic_brief_is_refused_with_a_move_the_conductor_can_make() {
+        // Sized from the measurement that started this: the 2645-byte dispatch
+        // that reached an opencode pane missing its first 2048 bytes. That one
+        // now refuses instead of arriving half-eaten.
+        let prompt = dispatch_prompt("sess-1", "abc123", &"x".repeat(2645));
+        let refusal = oversize_refusal(&prompt).expect("2645 bytes cannot arrive whole");
+
+        assert!(refusal.contains("too long to deliver intact"), "{refusal}");
+        // A verdict without a next move invites retrying the same brief.
+        assert!(
+            refusal.contains("Split this into smaller tasks"),
+            "{refusal}"
+        );
+        // The numbers have to be actionable, not decorative.
+        assert!(
+            refusal.contains(&format!("{} bytes;", prompt.len())),
+            "{refusal}"
+        );
+        // "a 1024 byte limit" read as though 1024 were allowed.
+        assert!(
+            refusal.contains("the most that can be delivered is 1023"),
+            "{refusal}"
+        );
+
+        assert_eq!(
+            oversize_refusal(&dispatch_prompt("sess-1", "abc123", "audit the parser")),
+            None,
+            "an ordinary brief must still go through"
+        );
     }
 
     // Both terminal injections share the same hard constraint: an embedded
@@ -1121,25 +1650,25 @@ mod tests {
 
     #[test]
     fn dispatch_precheck_refuses_when_halted() {
-        let err = dispatch_precheck(true, "sess-1", "sess-2", true).unwrap_err();
+        let err = dispatch_precheck(true, "sess-1", "sess-2", true, "short").unwrap_err();
         assert!(err.contains("halted"));
     }
 
     #[test]
     fn dispatch_precheck_refuses_self_dispatch() {
-        let err = dispatch_precheck(false, "sess-1", "sess-1", true).unwrap_err();
+        let err = dispatch_precheck(false, "sess-1", "sess-1", true, "short").unwrap_err();
         assert!(err.contains("cannot dispatch to yourself"));
     }
 
     #[test]
     fn dispatch_precheck_refuses_a_target_that_is_not_live() {
-        let err = dispatch_precheck(false, "sess-1", "sess-2", false).unwrap_err();
+        let err = dispatch_precheck(false, "sess-1", "sess-2", false, "short").unwrap_err();
         assert!(err.contains("no live session 'sess-2'"));
     }
 
     #[test]
     fn dispatch_precheck_passes_a_valid_dispatch() {
-        assert!(dispatch_precheck(false, "sess-1", "sess-2", true).is_ok());
+        assert!(dispatch_precheck(false, "sess-1", "sess-2", true, "short").is_ok());
     }
 
     #[test]
@@ -1299,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn age_times_out_a_stale_pending_task_but_leaves_other_statuses_alone() {
+    fn age_marks_a_stale_pending_task_overdue_but_leaves_other_statuses_alone() {
         let base = Task {
             id: "a".into(),
             from: "f".into(),
@@ -1311,15 +1840,84 @@ mod tests {
         };
 
         let mut pending = base.clone();
-        age(&mut pending, TASK_TIMEOUT_MS + 1);
-        assert_eq!(pending.status, "timeout");
+        age(&mut pending, TASK_OVERDUE_MS + 1);
+        assert_eq!(pending.status, "overdue");
 
         let mut errored = Task {
             status: "error".into(),
             ..base
         };
-        age(&mut errored, TASK_TIMEOUT_MS + 1);
+        age(&mut errored, TASK_OVERDUE_MS + 1);
         assert_eq!(errored.status, "error");
+    }
+
+    #[test]
+    fn an_overdue_task_still_accepts_its_result() {
+        // The bug this fixes. Nothing cancels a dispatched agent, so one that
+        // ran past the threshold kept working, finished the job, called
+        // complete_task, and was refused. The work was done and thrown away
+        // because a wall clock had moved.
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "long research task".into(),
+            status: "pending".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+
+        age(&mut tasks[0], TASK_OVERDUE_MS + 1);
+        assert_eq!(tasks[0].status, "overdue");
+
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-2", "abc123", "here is the report"),
+            Ok(())
+        );
+        assert_eq!(tasks[0].status, "done");
+        assert_eq!(tasks[0].result, "here is the report");
+    }
+
+    #[test]
+    fn genuinely_terminal_states_still_refuse_a_result() {
+        // The tolerance must not resurrect a cancelled task or silently
+        // rewrite one that already reported.
+        for status in ["cancelled", "done", "error"] {
+            let mut tasks = vec![Task {
+                id: "abc123".into(),
+                from: "sess-1".into(),
+                target: "sess-2".into(),
+                task: "t".into(),
+                status: status.into(),
+                result: "original".into(),
+                ts_ms: 0,
+            }];
+            assert_eq!(
+                finish_pending(&mut tasks, "sess-2", "abc123", "late overwrite"),
+                Err(TaskAccessError::NotPending),
+                "{status} must not accept a result"
+            );
+            assert_eq!(tasks[0].result, "original");
+        }
+    }
+
+    #[test]
+    fn an_overdue_task_still_checks_the_caller() {
+        // Accepting late results must not weaken authorization.
+        let mut tasks = vec![Task {
+            id: "abc123".into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "t".into(),
+            status: "overdue".into(),
+            result: String::new(),
+            ts_ms: 0,
+        }];
+        assert_eq!(
+            finish_pending(&mut tasks, "sess-3", "abc123", "stolen"),
+            Err(TaskAccessError::Forbidden)
+        );
+        assert_eq!(tasks[0].status, "overdue");
     }
 
     #[test]
@@ -1567,7 +2165,7 @@ pub fn start(
 ) -> std::io::Result<(u16, Arc<Shared>)> {
     let brain = load_brain(&dir);
     let shared = Arc::new(Shared {
-        app,
+        app: Notifier::to_app(app),
         dir: Mutex::new(dir),
         entries: Mutex::new(brain.entries),
         sessions: Mutex::new(brain.sessions),
