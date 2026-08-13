@@ -100,6 +100,16 @@ function App() {
   const [conductorHalted, setConductorHalted] = useState(false);
   const [dispatchOpen, setDispatchOpen] = useState(false);
   const [toasts, setToasts] = useState<string[]>([]); // dismissed task ids
+  // Toasts announce results as they arrive, so anything that finished before
+  // this launch is history rather than news. Without this the restored task
+  // store re-announced itself in full on every start — around fifty toasts to
+  // dismiss by hand.
+  //
+  // Deliberately not persisted. A task that finished in an earlier run is
+  // already excluded by its finish time, so the dismissed set only ever needs
+  // to cover the current run; persisting it would grow an unbounded id list in
+  // localStorage to re-answer a question this ref already answers.
+  const appStartedAt = useRef(Date.now());
   // Past the highest restored id: restored panes keep the ids they had, and a
   // counter starting from zero would hand a new session an id that is already
   // live, which the backend refuses.
@@ -586,7 +596,12 @@ function App() {
         />
       )}
       <ToastContainer
-        tasks={conductorTasks.filter((t) => !toasts.includes(t.id))}
+        tasks={conductorTasks.filter(
+          (t) =>
+            !toasts.includes(t.id) &&
+            t.done_ms !== null &&
+            t.done_ms >= appStartedAt.current,
+        )}
         onDismiss={dismissToast}
       />
     </div>

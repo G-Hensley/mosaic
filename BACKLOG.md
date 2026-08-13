@@ -397,6 +397,54 @@ it must be, or the conductor cannot tell "finished" from "gave up waiting".
 Related: the roster's busy and OVERDUE markers already tell a conductor a pane
 is slow. This is the other half, letting it act on that without spinning.
 
+## A blocked agent can only ask the human, never the conductor
+
+Dispatch is one-way. `dispatch` hands a brief to a pane and returns; the only
+path back is `complete_task` at the end. So an agent that hits a genuine
+ambiguity mid-task has three options, and all of them are bad: guess and risk
+doing competent work on the wrong decision, stall until someone notices, or ask
+the human in its own terminal.
+
+Asking the human is the least bad of the three, and it is what happens. It is
+also the one that scales worst. Observed 2026-08-13: sess-4, working a dispatched
+task, put its question to the user rather than to the conductor that briefed it.
+The user's own words were that it "probably should've routed to you". With five
+panes working in parallel, every one of them holds this option, so the human
+becomes the synchronisation point for questions they did not ask and lack the
+context to answer — which is the exact cost conducting was supposed to remove.
+
+The conductor is usually the *better* answerer, not merely the more appropriate
+one. It wrote the brief, it holds the reasoning the brief compressed away, and
+it can see the other tasks in flight. In this case the conductor had already
+made and recorded the relevant decisions; the agent simply had no way to reach
+them.
+
+**The shape to aim for.** An `ask_conductor` call: a blocked agent poses a
+question against its `task_id`, the question surfaces in the conductor's pane
+the way a task result does, and the answer is delivered back to the waiting
+agent. The task stays open and distinguishable throughout — `blocked` is a
+different thing from `pending`, and a conductor collecting results needs to see
+the difference.
+
+Open questions worth settling before building:
+
+- **What happens when no conductor is live, or it is halted.** Falling back to
+  the human is right, but it must be a deliberate fallback rather than the
+  silent default it is today.
+- **Whether the agent blocks or continues.** Blocking is simpler and matches
+  what an agent does now when it asks; continuing on the parts that do not
+  depend on the answer is better use of the pane but much harder to get right.
+- **A ceiling.** A pane that can interrupt the conductor can do so in a loop,
+  and the conductor's context is the scarce resource in a long session. The
+  `MAX_DISPATCHES` precedent applies.
+- **Whether the answer is recorded on the task.** It is a decision made
+  mid-task, and `record_decision` already exists for exactly this class of fact.
+  A question answered and then lost is one the next agent asks again.
+
+Interacts with the `wait_for_tasks` entry above: both are about a conductor and
+a pane needing to communicate between dispatch and completion, and they should
+share one mechanism rather than grow two.
+
 ## Nothing enforces cross-model review, so "done" means self-certified
 
 The policy already exists and is specific. `CONTRIBUTING.md` ("Review before
@@ -453,6 +501,30 @@ nothing about what that session is *good at*. So routing is guesswork, and the
 guesses have been wrong in practice: broad web research kept going to OpenCode
 sessions on a free-tier model, which is close to the worst available match for
 it.
+
+**Mosaic does not merely omit the model, it never learns it.** `SESSION_TYPES`
+in `src/lib/ipc.ts` launches each agent CLI bare — `{ id: "opencode", program:
+"opencode", args: [] }`, and the same for `claude` and `codex`. No model flag is
+passed, so the model is whatever that CLI's own config selects, and Mosaic has
+no channel to find out. Any fix here starts by *acquiring* the fact, not by
+plumbing one Mosaic already holds.
+
+Two places currently overstate what is known, which is worth correcting whether
+or not the larger item is built. The `list_sessions` tool description advertises
+"their model/CLI, brain", and the comment at `src-tauri/src/mcp.rs:110` says
+"Just id and model". Both describe the roster's `(opencode)` as a model; it is
+the `SessionType.label` from the launcher. A conductor reading either
+description reasonably believes it has information it does not have.
+
+**Confirmed the expensive way, 2026-08-13.** Three tasks were dispatched to
+sess-4 (codex), sess-6 (opencode) and sess-8 (opencode). sess-8 was a local
+model via Ollama and produced nothing at all; sess-6, listed identically as
+`(opencode)`, worked fine. Nothing in the roster distinguished them, and the
+conductor only caught it by reading `git status` in each pane's worktree on disk
+and noticing sess-8's was clean. The user knew which pane was local — the
+conductor could not. This is the same failure the liveness entry above describes,
+approached from the routing side rather than the detection side: the cheapest
+pane to hand work to is the one most likely to silently drop it.
 
 `Projects/knowledge/ai-kbase/MODEL-GUIDE.md` already contains the missing
 knowledge, maintained and dated, including a task-to-model routing table, per
