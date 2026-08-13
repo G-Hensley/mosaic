@@ -339,6 +339,19 @@ impl Shared {
     pub fn roster_lines(&self) -> Vec<String> {
         let identified = self.sessions_snapshot();
         let conductor = self.conductor();
+        let now = Self::now_ms();
+        // Presence is not readiness. A pane that took a task and went quiet is
+        // listed exactly like an idle one, so a conductor picks it again and
+        // waits on a result that is not coming. The open task and its age are
+        // the cheapest honest signal available here.
+        let open_for: Vec<(String, u64)> = {
+            let tasks = self.tasks.lock().unwrap();
+            tasks
+                .iter()
+                .filter(|t| is_open(&t.status))
+                .map(|t| (t.target.clone(), now.saturating_sub(t.ts_ms)))
+                .collect()
+        };
         let mut ids = self.engine.ids();
         ids.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         ids.iter()
@@ -354,7 +367,14 @@ impl Shared {
                 } else {
                     ""
                 };
-                format!("- {id} ({kind}) brain={room}{role}")
+                // The oldest open task, because that is the one most likely to
+                // be stuck and the one worth warning about.
+                let busy = open_for
+                    .iter()
+                    .filter(|(target, _)| target == id)
+                    .map(|(_, age_ms)| *age_ms)
+                    .max();
+                format!("- {id} ({kind}) brain={room}{role}{}", busy_label(busy))
             })
             .collect()
     }
@@ -588,6 +608,36 @@ impl Shared {
 ///
 /// "overdue" is deliberately not terminal. The agent is still running and its
 /// result is still accepted, so this only marks the task as slow.
+/// What to append to a roster line for a pane's oldest open task.
+///
+/// Past the overdue threshold the wording changes deliberately. "busy 45m" and
+/// "busy 45m, OVERDUE, may be stuck" are the same fact, but only the second
+/// tells a conductor to stop waiting and consider another target. A pane that
+/// took a task and went silent was previously indistinguishable from an idle
+/// one, and got picked again.
+fn busy_label(oldest_open_ms: Option<u64>) -> String {
+    match oldest_open_ms {
+        None => String::new(),
+        Some(ms) if ms > TASK_OVERDUE_MS => {
+            format!(" [busy {}, OVERDUE, may be stuck]", human_ms(ms))
+        }
+        Some(ms) => format!(" [busy {}]", human_ms(ms)),
+    }
+}
+
+/// A duration a human reads at a glance. Roster lines are scanned, not parsed.
+fn human_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    format!("{}h{:02}m", mins / 60, mins % 60)
+}
+
 fn age(t: &mut Task, now: u64) {
     if t.status == "pending" && now.saturating_sub(t.ts_ms) > TASK_OVERDUE_MS {
         t.status = "overdue".to_string();
@@ -995,7 +1045,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "List the other AI agents live in this workspace right now, with their model/CLI and brain. Call this when you are planning work: if you are the conductor these are real, idle agents you can hand tasks to in parallel via dispatch."
+        description = "List the other AI agents live in this workspace right now, with their model/CLI, brain, and whether each is already working. Call this when you are planning work: if you are the conductor these are real agents you can hand tasks to in parallel via dispatch. A pane marked [busy ...] already has an open task; one marked OVERDUE has held it past the expected window and may be stuck, so prefer a free pane over waiting on it."
     )]
     fn list_sessions(&self) -> String {
         let lines = self.shared.roster_lines();
@@ -1142,12 +1192,40 @@ impl BrainHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        age, append_record, bearer_matches, conductor_briefing, dispatch_precheck, dispatch_prompt,
-        finish_pending, load_brain, mark_pending_error, mint_session_token, render_task,
-        render_task_summary, select_tasks, task_for_dispatcher, validate_path_component,
-        AgentSession, Entry, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS,
-        TASK_OVERDUE_MS,
+        age, append_record, bearer_matches, busy_label, conductor_briefing, dispatch_precheck,
+        dispatch_prompt, finish_pending, human_ms, load_brain, mark_pending_error,
+        mint_session_token, render_task, render_task_summary, select_tasks, task_for_dispatcher,
+        validate_path_component, AgentSession, Entry, StoreRecord, Task, TaskAccessError,
+        RECENT_FINISHED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
     };
+
+    #[test]
+    fn a_free_pane_carries_no_busy_marker() {
+        assert_eq!(busy_label(None), "");
+    }
+
+    #[test]
+    fn a_pane_past_the_overdue_window_is_called_out_not_just_timed() {
+        // Both strings carry the same number. Only one tells a conductor to
+        // stop waiting, which is the whole point: a silent pane used to look
+        // exactly like an idle one and got dispatched to again.
+        let working = busy_label(Some(TASK_OVERDUE_MS - 1));
+        let stuck = busy_label(Some(TASK_OVERDUE_MS + 1));
+
+        assert!(working.contains("busy"));
+        assert!(!working.contains("OVERDUE"));
+        assert!(stuck.contains("OVERDUE"));
+        assert!(stuck.contains("may be stuck"));
+    }
+
+    #[test]
+    fn durations_read_at_a_glance() {
+        assert_eq!(human_ms(0), "0s");
+        assert_eq!(human_ms(45 * 1000), "45s");
+        assert_eq!(human_ms(90 * 1000), "1m");
+        assert_eq!(human_ms(45 * 60 * 1000), "45m");
+        assert_eq!(human_ms(3 * 60 * 60 * 1000 + 7 * 60 * 1000), "3h07m");
+    }
 
     fn task_at(id: &str, status: &str, ts_ms: u64) -> Task {
         Task {
