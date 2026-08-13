@@ -59,11 +59,14 @@ fn injection_overage(injection: &str) -> Option<usize> {
 fn oversize_refusal(injection: &str) -> Option<String> {
     injection_overage(injection).map(|over| {
         format!(
-            "brief is {over} bytes too long to deliver intact ({} bytes against a \
-             {MAX_INJECTION_BYTES} byte limit). Longer briefs reach the agent with the \
-             beginning silently missing. Split this into smaller tasks, or shorten it and \
-             point the agent at a file for the detail.",
-            injection.len()
+            // "a {MAX} byte limit" read as though 1024 were allowed. It is the
+            // refusal threshold, so the largest that goes through is one less.
+            "brief is {over} bytes too long to deliver intact ({} bytes; the most that \
+             can be delivered is {}). Longer briefs reach the agent with the beginning \
+             silently missing. Split this into smaller tasks, or shorten it and point \
+             the agent at a file for the detail.",
+            injection.len(),
+            MAX_INJECTION_BYTES - 1
         )
     })
 }
@@ -232,7 +235,7 @@ const TASK_OVERDUE_MS: u64 = 20 * 60 * 1000;
 /// when the prompt could not be written to the target's terminal — the task
 /// still exists, in "error" status, rather than vanishing silently the way a
 /// failed dispatch used to.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DispatchOutcome {
     pub task_id: String,
     pub delivered: bool,
@@ -252,6 +255,7 @@ fn dispatch_precheck(
     from: &str,
     target: &str,
     target_is_live: bool,
+    injection: &str,
 ) -> Result<(), String> {
     if halted {
         return Err("dispatch is halted by the user (Stop). Do not retry.".to_string());
@@ -264,12 +268,63 @@ fn dispatch_precheck(
             "no live session '{target}'. Call list_sessions for valid targets."
         ));
     }
+    // Last, so a conductor that got the target wrong hears about the target.
+    // Both errors are actionable, but only one of them is about the thing the
+    // conductor just typed.
+    if let Some(refusal) = oversize_refusal(injection) {
+        return Err(refusal);
+    }
     Ok(())
+}
+
+/// How `Shared` tells the UI something changed.
+///
+/// A seam, for one reason: `Shared` used to hold an `AppHandle` directly, and
+/// an `AppHandle` cannot be built outside a running app. That made every policy
+/// living on a `Shared` method unreachable from a test, so it could only be
+/// verified by reading the code — which is exactly how the dispatch gate's
+/// ordering went untested until a reviewer asked.
+///
+/// `tauri::test::mock_app()` is the other way to solve this, but its handle is
+/// `AppHandle<MockRuntime>`, so taking it means making `Shared` generic over the
+/// runtime and threading that parameter through every caller. This is smaller
+/// and the emissions are fire-and-forget anyway.
+/// A closure rather than an `AppHandle` variant, and that detail is the whole
+/// point. Holding an `AppHandle` anywhere in `Shared`'s type graph makes the
+/// compiler instantiate `AppHandle<Wry>`'s drop glue for any test that builds a
+/// `Shared`, which drags Wry's runtime into the test binary and fails it at
+/// *load* time with `STATUS_ENTRYPOINT_NOT_FOUND` — before a single test runs,
+/// with no hint as to the cause. Erasing the handle behind `dyn Fn` keeps it
+/// out of `Shared` entirely.
+/// Named so the `Notifier` field stays readable; clippy flags the raw form as
+/// a very complex type.
+type EmitFn = Box<dyn Fn(&str) + Send + Sync>;
+
+pub struct Notifier(Option<EmitFn>);
+
+impl Notifier {
+    pub fn to_app(app: AppHandle) -> Self {
+        Notifier(Some(Box::new(move |event| {
+            let _ = app.emit(event, ());
+        })))
+    }
+
+    /// Drops events. Tests assert on state, not on notifications.
+    #[cfg(test)]
+    pub fn silent() -> Self {
+        Notifier(None)
+    }
+
+    fn emit(&self, event: &str) {
+        if let Some(send) = &self.0 {
+            send(event);
+        }
+    }
 }
 
 /// The shared store — one instance, cloned by Arc into every agent's handler.
 pub struct Shared {
-    app: AppHandle,
+    app: Notifier,
     /// Where entries are mirrored as markdown. Follows the picked project, so it
     /// changes at runtime rather than being fixed at startup.
     dir: Mutex<PathBuf>,
@@ -302,8 +357,8 @@ impl Shared {
         *self.entries.lock().unwrap() = brain.entries;
         *self.sessions.lock().unwrap() = brain.sessions;
         *self.tasks.lock().unwrap() = brain.tasks;
-        let _ = self.app.emit("context-changed", ());
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("context-changed");
+        self.app.emit("conductor-changed");
     }
 
     /// The brain a given agent name is currently in. Defaults to "main".
@@ -324,7 +379,7 @@ impl Shared {
             .lock()
             .unwrap()
             .insert(name.to_string(), room.to_string());
-        let _ = self.app.emit("context-changed", ());
+        self.app.emit("context-changed");
         Ok(())
     }
 
@@ -350,7 +405,7 @@ impl Shared {
         let _ = append_line(&file, &format!("- **{topic}** ({author}): {body}\n"));
         let _ = append_record(&dir, &StoreRecord::Entry(entry.clone()));
         self.entries.lock().unwrap().push(entry);
-        let _ = self.app.emit("context-changed", ());
+        self.app.emit("context-changed");
     }
 
     pub fn entries_snapshot(&self) -> Vec<Entry> {
@@ -375,7 +430,7 @@ impl Shared {
             s.push(session);
         }
         drop(s);
-        let _ = self.app.emit("context-changed", ());
+        self.app.emit("context-changed");
     }
 
     // ---- conductor ----
@@ -451,7 +506,7 @@ impl Shared {
     /// Dispatch still submits, because there no human is at the keyboard.
     pub fn set_conductor(&self, name: Option<String>) {
         *self.conductor.lock().unwrap() = name.clone();
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("conductor-changed");
 
         let Some(target) = name else { return };
         // A Shell pane has no MCP connection, so it cannot dispatch and the
@@ -495,7 +550,7 @@ impl Shared {
         } else {
             *self.dispatches.lock().unwrap() = 0;
         }
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("conductor-changed");
     }
 
     pub fn is_halted(&self) -> bool {
@@ -520,7 +575,7 @@ impl Shared {
         let dir = self.dir.lock().unwrap().clone();
         let _ = append_record(&dir, &StoreRecord::Task(t.clone()));
         self.tasks.lock().unwrap().push(t);
-        let _ = self.app.emit("conductor-changed", ());
+        self.app.emit("conductor-changed");
     }
 
     fn finish_task(&self, caller: &str, id: &str, result: &str) -> Result<(), TaskAccessError> {
@@ -537,7 +592,7 @@ impl Shared {
                 let dir = self.dir.lock().unwrap().clone();
                 let _ = append_record(&dir, &StoreRecord::Task(task));
             }
-            let _ = self.app.emit("conductor-changed", ());
+            self.app.emit("conductor-changed");
         }
         found
     }
@@ -558,7 +613,7 @@ impl Shared {
                 let dir = self.dir.lock().unwrap().clone();
                 let _ = append_record(&dir, &StoreRecord::Task(task));
             }
-            let _ = self.app.emit("conductor-changed", ());
+            self.app.emit("conductor-changed");
         }
     }
 
@@ -622,19 +677,15 @@ impl Shared {
         task: &str,
     ) -> Result<DispatchOutcome, String> {
         let target_is_live = self.engine.ids().iter().any(|i| i == target);
-        dispatch_precheck(self.is_halted(), from, target, target_is_live)?;
 
+        // Built before the gate because the size rule needs the finished
+        // injection, and the id is part of what it measures. Nothing here
+        // mutates: every refusal below still costs no budget and records no
+        // task, which `a_refused_dispatch_charges_nothing_and_records_nothing`
+        // holds us to.
         let id = uuid::Uuid::new_v4().simple().to_string();
         let injection = dispatch_prompt(from, &id, task);
-
-        // Checked before the budget is spent and before the task is recorded,
-        // so a refused dispatch costs nothing and leaves no phantom task for
-        // the conductor to poll. A brief this long was silently arriving with
-        // its first half missing; refusing is the honest outcome, and the
-        // conductor's fix is the one it should have made anyway.
-        if let Some(refusal) = oversize_refusal(&injection) {
-            return Err(refusal);
-        }
+        dispatch_precheck(self.is_halted(), from, target, target_is_live, &injection)?;
 
         if !self.take_dispatch_budget() {
             return Err("dispatch budget exhausted for this run.".to_string());
@@ -1028,7 +1079,7 @@ impl BrainHandler {
                 return format!("Refused: {e}.");
             }
         }
-        let _ = self.shared.app.emit("context-changed", ());
+        self.shared.app.emit("context-changed");
         format!(
             "Identity set to '{}' in brain '{}'",
             p.name,
@@ -1258,9 +1309,12 @@ mod tests {
         age, append_record, bearer_matches, busy_label, conductor_briefing, dispatch_precheck,
         dispatch_prompt, finish_pending, human_ms, injection_overage, load_brain,
         mark_pending_error, mint_session_token, oversize_refusal, render_task, render_task_summary,
-        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry,
-        StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS, TASK_OVERDUE_MS,
+        select_tasks, task_for_dispatcher, validate_path_component, AgentSession, Entry, Notifier,
+        Shared, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS,
+        TASK_OVERDUE_MS,
     };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_free_pane_carries_no_busy_marker() {
@@ -1413,6 +1467,70 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_refuses_an_oversized_brief_but_reports_the_target_first() {
+        let long = dispatch_prompt("sess-1", "abc123", &"x".repeat(2000));
+
+        let err = dispatch_precheck(false, "sess-1", "sess-2", true, &long).unwrap_err();
+        assert!(err.contains("too long to deliver intact"), "{err}");
+
+        // Both are wrong here. The target is the one the conductor can act on
+        // without rewriting anything, so it wins.
+        let err = dispatch_precheck(false, "sess-1", "sess-2", false, &long).unwrap_err();
+        assert!(err.contains("no live session"), "{err}");
+    }
+
+    /// A `Shared` with no live sessions and a scratch store.
+    ///
+    /// Possible only because of the `Notifier` seam: `Shared` used to hold an
+    /// `AppHandle`, which cannot exist outside a running app, so every policy
+    /// on a `Shared` method could only be verified by reading it. The `TempDir`
+    /// is returned because dropping it would delete the store mid-test.
+    fn shared_for_test() -> (Arc<Shared>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = Arc::new(Shared {
+            app: Notifier::silent(),
+            dir: Mutex::new(dir.path().to_path_buf()),
+            entries: Mutex::new(Vec::new()),
+            sessions: Mutex::new(Vec::new()),
+            name_to_room: Mutex::new(HashMap::new()),
+            engine: Arc::new(crate::SessionManager::default()),
+            conductor: Mutex::new(Some("sess-1".to_string())),
+            halted: Mutex::new(false),
+            tasks: Mutex::new(Vec::new()),
+            dispatches: Mutex::new(0),
+        });
+        // `app` owns the runtime the handle points at, so it has to outlive the
+        // handle. Leaking it is cheaper than threading it through every caller
+        // and this is a test process that is about to exit.
+
+        (shared, dir)
+    }
+
+    #[test]
+    fn a_refused_dispatch_charges_nothing_and_records_nothing() {
+        // The property the whole gate rests on, and the one a reviewer caught
+        // as untested: refusal happens before *any* mutation. Move
+        // `dispatch_precheck` below `take_dispatch_budget` or `add_task` and
+        // this fails, while every pure test above stays green.
+        let (shared, _dir) = shared_for_test();
+
+        let err = shared
+            .dispatch_task("sess-1", "sess-2", "audit the parser")
+            .expect_err("no session is live in this fixture");
+        assert!(err.contains("no live session"), "{err}");
+
+        assert!(
+            shared.tasks_from("sess-1").is_empty(),
+            "a refused dispatch left a task the conductor can never collect"
+        );
+        assert_eq!(
+            *shared.dispatches.lock().unwrap(),
+            0,
+            "a refused dispatch charged the budget"
+        );
+    }
+
+    #[test]
     fn a_realistic_brief_is_refused_with_a_move_the_conductor_can_make() {
         // Sized from the measurement that started this: the 2645-byte dispatch
         // that reached an opencode pane missing its first 2048 bytes. That one
@@ -1428,7 +1546,12 @@ mod tests {
         );
         // The numbers have to be actionable, not decorative.
         assert!(
-            refusal.contains(&format!("{} bytes against", prompt.len())),
+            refusal.contains(&format!("{} bytes;", prompt.len())),
+            "{refusal}"
+        );
+        // "a 1024 byte limit" read as though 1024 were allowed.
+        assert!(
+            refusal.contains("the most that can be delivered is 1023"),
             "{refusal}"
         );
 
@@ -1527,25 +1650,25 @@ mod tests {
 
     #[test]
     fn dispatch_precheck_refuses_when_halted() {
-        let err = dispatch_precheck(true, "sess-1", "sess-2", true).unwrap_err();
+        let err = dispatch_precheck(true, "sess-1", "sess-2", true, "short").unwrap_err();
         assert!(err.contains("halted"));
     }
 
     #[test]
     fn dispatch_precheck_refuses_self_dispatch() {
-        let err = dispatch_precheck(false, "sess-1", "sess-1", true).unwrap_err();
+        let err = dispatch_precheck(false, "sess-1", "sess-1", true, "short").unwrap_err();
         assert!(err.contains("cannot dispatch to yourself"));
     }
 
     #[test]
     fn dispatch_precheck_refuses_a_target_that_is_not_live() {
-        let err = dispatch_precheck(false, "sess-1", "sess-2", false).unwrap_err();
+        let err = dispatch_precheck(false, "sess-1", "sess-2", false, "short").unwrap_err();
         assert!(err.contains("no live session 'sess-2'"));
     }
 
     #[test]
     fn dispatch_precheck_passes_a_valid_dispatch() {
-        assert!(dispatch_precheck(false, "sess-1", "sess-2", true).is_ok());
+        assert!(dispatch_precheck(false, "sess-1", "sess-2", true, "short").is_ok());
     }
 
     #[test]
@@ -2042,7 +2165,7 @@ pub fn start(
 ) -> std::io::Result<(u16, Arc<Shared>)> {
     let brain = load_brain(&dir);
     let shared = Arc::new(Shared {
-        app,
+        app: Notifier::to_app(app),
         dir: Mutex::new(dir),
         entries: Mutex::new(brain.entries),
         sessions: Mutex::new(brain.sessions),
