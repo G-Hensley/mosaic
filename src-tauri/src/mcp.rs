@@ -690,6 +690,70 @@ fn render_task(t: &Task) -> String {
     }
 }
 
+/// How much of the original brief to echo back in a multi-task listing.
+const TASK_ECHO_CHARS: usize = 160;
+
+/// Terminal tasks kept in the default listing, newest first.
+const RECENT_FINISHED: usize = 10;
+
+fn is_open(status: &str) -> bool {
+    // "overdue" is explicitly still running, so it belongs with pending.
+    status == "pending" || status == "overdue"
+}
+
+fn truncate_chars(s: &str, limit: usize) -> String {
+    let mut out: String = s.chars().take(limit).collect();
+    if s.chars().nth(limit).is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+/// One task in a listing.
+///
+/// Deliberately does NOT echo the whole brief. The conductor wrote it and
+/// still has it; replaying every prompt back is what grew this response to
+/// 111k characters over 39 tasks, past the tool response limit, so the
+/// documented way to collect a fan-out failed exactly when a workspace had
+/// been used enough to need it. The result is kept whole, because that is the
+/// part the caller does not already have.
+fn render_task_summary(t: &Task) -> String {
+    let brief = truncate_chars(&t.task, TASK_ECHO_CHARS);
+    if t.status == "done" {
+        format!("[done] {} → {}\n{}", t.target, brief, t.result)
+    } else {
+        format!("[{}] {} → {}", t.status, t.target, brief)
+    }
+}
+
+/// The tasks a listing should show, and how many were held back.
+///
+/// Open tasks are never dropped: "what am I still waiting on" is the question
+/// this tool exists to answer, and truncating that would be worse than the
+/// size problem it fixes.
+fn select_tasks(mine: Vec<Task>, include_all: bool, status: &str) -> (Vec<Task>, usize) {
+    if !status.is_empty() {
+        let filtered: Vec<Task> = mine.into_iter().filter(|t| t.status == status).collect();
+        return (filtered, 0);
+    }
+    if include_all {
+        return (mine, 0);
+    }
+    let total = mine.len();
+    let (open, finished): (Vec<Task>, Vec<Task>) =
+        mine.into_iter().partition(|t| is_open(&t.status));
+    let kept_finished = finished.len().min(RECENT_FINISHED);
+    let dropped = finished.len() - kept_finished;
+    // Newest finished first, then re-joined after the open ones.
+    let mut recent: Vec<Task> = finished;
+    recent.sort_by_key(|t| std::cmp::Reverse(t.ts_ms));
+    recent.truncate(kept_finished);
+    let mut out = open;
+    out.extend(recent);
+    debug_assert!(out.len() + dropped == total);
+    (out, dropped)
+}
+
 fn append_line(path: &PathBuf, s: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
@@ -804,10 +868,19 @@ pub struct CompleteArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskQuery {
-    /// A single task_id to check. Leave this out to get every task you have
-    /// dispatched, which is the efficient way to collect a parallel fan-out.
+    /// A single task_id to check. Leave this out to collect the fan-out you
+    /// are waiting on, which is the efficient way to gather parallel work.
     #[serde(default)]
     pub task_id: String,
+    /// Only tasks with this status: pending, overdue, done, error or
+    /// cancelled. Use "pending" or "overdue" to ask what is still running.
+    #[serde(default)]
+    pub status: String,
+    /// Include the whole dispatch history rather than open tasks plus the
+    /// most recent finished ones. Large workspaces can exceed the response
+    /// limit; prefer `status` when you want something specific.
+    #[serde(default)]
+    pub include_all: bool,
 }
 
 #[tool_router]
@@ -1005,7 +1078,7 @@ impl BrainHandler {
     }
 
     #[tool(
-        description = "Collect the results of work you dispatched. Call with no task_id to get every task you dispatched at once — do that instead of polling ids one by one. Statuses are pending, overdue, done (with the result), error or cancelled. An overdue task is STILL RUNNING and its result is still accepted: it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it."
+        description = "Collect the results of work you dispatched. Call with no task_id to get every open task plus the most recently finished ones at once — do that instead of polling ids one by one. Briefs are abbreviated in that listing; pass a task_id for one task in full, status to filter (pending, overdue, done, error, cancelled), or include_all for the whole history. Statuses: an overdue task is STILL RUNNING and its result is still accepted, it has just taken longer than expected, so keep waiting rather than treating it as failed or re-dispatching it."
     )]
     fn get_task_result(&self, Parameters(p): Parameters<TaskQuery>) -> String {
         if !p.task_id.is_empty() {
@@ -1027,18 +1100,39 @@ impl BrainHandler {
         if mine.is_empty() {
             return "You have not dispatched any tasks.".to_string();
         }
-        let pending = mine.iter().filter(|t| t.status == "pending").count();
-        let mut out = format!(
-            "# Your dispatched tasks ({} total, {} still running)\n",
-            mine.len(),
-            pending
-        );
-        for t in &mine {
+        let total = mine.len();
+        let running = mine.iter().filter(|t| is_open(&t.status)).count();
+        let (shown, dropped) = select_tasks(mine, p.include_all, &p.status);
+
+        if shown.is_empty() {
+            return format!(
+                "No tasks with status '{}'. {total} dispatched in all.",
+                p.status
+            );
+        }
+
+        let mut out = if p.status.is_empty() {
+            format!("# Your dispatched tasks ({total} total, {running} still running)\n")
+        } else {
+            format!(
+                "# Your dispatched tasks with status '{}' ({} of {total})\n",
+                p.status,
+                shown.len()
+            )
+        };
+        for t in &shown {
             out.push_str(&format!(
                 "\n## {} → {}\n{}\n",
                 t.id,
                 t.target,
-                render_task(t)
+                render_task_summary(t)
+            ));
+        }
+        if dropped > 0 {
+            out.push_str(&format!(
+                "\n{dropped} older finished task(s) not shown. Pass include_all for the \
+                 whole history, or status to filter. Briefs are abbreviated here; pass a \
+                 task_id for one task in full.\n"
             ));
         }
         out
@@ -1050,9 +1144,90 @@ mod tests {
     use super::{
         age, append_record, bearer_matches, conductor_briefing, dispatch_precheck, dispatch_prompt,
         finish_pending, load_brain, mark_pending_error, mint_session_token, render_task,
-        task_for_dispatcher, validate_path_component, AgentSession, Entry, StoreRecord, Task,
-        TaskAccessError, TASK_OVERDUE_MS,
+        render_task_summary, select_tasks, task_for_dispatcher, validate_path_component,
+        AgentSession, Entry, StoreRecord, Task, TaskAccessError, RECENT_FINISHED, TASK_ECHO_CHARS,
+        TASK_OVERDUE_MS,
     };
+
+    fn task_at(id: &str, status: &str, ts_ms: u64) -> Task {
+        Task {
+            id: id.into(),
+            from: "sess-1".into(),
+            target: "sess-2".into(),
+            task: "audit the parser".into(),
+            status: status.into(),
+            result: String::new(),
+            ts_ms,
+        }
+    }
+
+    #[test]
+    fn a_listing_never_drops_an_open_task() {
+        // "What am I still waiting on" is the question this tool exists to
+        // answer, so windowing must never cost an open task.
+        let mut tasks: Vec<Task> = (0..RECENT_FINISHED as u64 * 3)
+            .map(|i| task_at(&format!("done{i}"), "done", i))
+            .collect();
+        tasks.push(task_at("open1", "pending", 999));
+        tasks.push(task_at("open2", "overdue", 1000));
+
+        let (shown, dropped) = select_tasks(tasks, false, "");
+
+        let ids: Vec<&str> = shown.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"open1"), "pending task was dropped");
+        assert!(ids.contains(&"open2"), "overdue task was dropped");
+        assert_eq!(shown.len(), 2 + RECENT_FINISHED);
+        assert_eq!(dropped, RECENT_FINISHED * 3 - RECENT_FINISHED);
+    }
+
+    #[test]
+    fn a_listing_keeps_the_newest_finished_tasks() {
+        let tasks: Vec<Task> = (0..RECENT_FINISHED as u64 + 5)
+            .map(|i| task_at(&format!("t{i}"), "done", i))
+            .collect();
+
+        let (shown, dropped) = select_tasks(tasks, false, "");
+
+        assert_eq!(dropped, 5);
+        let oldest_kept = shown.iter().map(|t| t.ts_ms).min().unwrap();
+        assert_eq!(oldest_kept, 5, "kept the oldest instead of the newest");
+    }
+
+    #[test]
+    fn include_all_and_status_bypass_the_window() {
+        let tasks: Vec<Task> = (0..RECENT_FINISHED as u64 + 5)
+            .map(|i| task_at(&format!("t{i}"), "done", i))
+            .collect();
+        let total = tasks.len();
+
+        let (all, dropped) = select_tasks(tasks.clone(), true, "");
+        assert_eq!(all.len(), total);
+        assert_eq!(dropped, 0);
+
+        let (none, _) = select_tasks(tasks, false, "pending");
+        assert!(none.is_empty(), "status filter must not invent matches");
+    }
+
+    #[test]
+    fn a_listing_abbreviates_the_brief_but_never_the_result() {
+        // The conductor wrote the brief and still has it. Replaying every
+        // prompt is what pushed this response past the tool's size limit.
+        let long_brief = "b".repeat(TASK_ECHO_CHARS * 4);
+        let long_result = "r".repeat(4000);
+        let mut t = task_at("abc", "done", 0);
+        t.task = long_brief.clone();
+        t.result = long_result.clone();
+
+        let summary = render_task_summary(&t);
+
+        assert!(!summary.contains(&long_brief), "brief was echoed in full");
+        assert!(summary.contains("..."), "truncation was not marked");
+        assert!(summary.contains(&long_result), "result must survive whole");
+        assert!(
+            render_task(&t).contains(&long_brief),
+            "single lookup stays full"
+        );
+    }
 
     #[test]
     fn dispatch_prompt_is_single_line_and_includes_completion_contract() {
