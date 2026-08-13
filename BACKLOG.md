@@ -324,6 +324,42 @@ to notice. Dispatch should verify what landed, or fail loudly.
 Distinct from the submit race in `IMPROVEMENT-AUDIT.md` #1, which drops the
 Enter rather than the text.
 
+## The limit, checked against the dispatches that had already gone silent
+
+Three review dispatches from 2026-08-13, measured after the fact against the
+1024-byte rule:
+
+| task | injection | would lose | outcome |
+|---|---:|---:|---|
+| sess-2, `mcp.rs` review | 967 B | 0 | **done**, 2161-char result |
+| sess-3, auth review | 975 B | 0 | pending at 30m |
+| sess-5, auth review | 2366 B | **2048** | pending at 341m |
+
+The sess-5 dispatch lost two whole chunks and arrived as roughly 318 bytes of
+tail. It was never going to come back, and the pane was not at fault: it was
+handed a fragment. That dispatch is exactly what `MAX_INJECTION_BYTES` now
+refuses, so the case the limit was built for had already happened and had
+already been misread as a slow agent.
+
+Worth stating plainly because the wrong lesson was available and tempting: for
+five hours the visible evidence was "opencode panes do not finish reviews".
+Two of the three panes were fine. The conductor was sending briefs that could
+not arrive.
+
+**What it does not explain.** The sess-3 dispatch fits in one chunk, arrived
+whole, and still produced nothing after 30 minutes while its pane stayed live.
+That is a genuinely slow or stuck agent, and it is the case `#22` and the
+`wait_for_tasks` entry below are about. Two different failures wearing the same
+symptom, `status: pending` forever, is the reason both need fixing: without a
+size guarantee there is no way to tell them apart, and every silent pane looks
+like a bad model.
+
+**Consequence for routing.** Until a stuck pane can be told from a slow one,
+the only honest signal is demonstrated completion. sess-2 has returned
+substantive reviews twice; the auth review was re-dispatched there rather than
+retried on a pane that had already gone quiet. That is a workaround, not
+routing, and it is what `#24` should replace.
+
 ## A conductor cannot wait for a dispatch, only re-ask whether it landed
 
 `get_task_result` is a poll. There is no call that blocks until a task
