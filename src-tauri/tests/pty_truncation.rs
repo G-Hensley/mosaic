@@ -1,4 +1,23 @@
 #![cfg(windows)]
+//! ConPTY delivery measurement, for investigating the dispatch truncation.
+//!
+//! **Ignored by default, and run deliberately:**
+//!
+//! ```text
+//! cargo test --test pty_truncation -- --ignored --nocapture
+//! ```
+//!
+//! These are a measurement harness, not regression tests. They open a real
+//! ConPTY, write a payload through the same writer `spawn_session` uses, and
+//! report what arrives. On a headless CI runner that measurement is not
+//! meaningful: there is no console behind the pseudo-console, the child
+//! returns nothing, and the harness reports a loss that says more about the
+//! runner than about ConPTY. Left un-ignored they were failing every CI run on
+//! this repository while passing on a desktop, which is a test that reports
+//! the environment rather than the code.
+//!
+//! `--nocapture` matters: the numbers are the output, and the assertions only
+//! guard the conclusion drawn from them.
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
@@ -74,11 +93,20 @@ fn read_line_through_conpty(payload: &[u8], delay_reader: bool) -> (bool, Vec<u8
 }
 
 #[test]
+#[ignore = "needs a real console; see the module comment"]
 fn measure_conpty_single_write_delivery() {
     println!("requested received lost leading_loss write_all_ok suffix");
     for size in [512, 1024, 2048, 4096, 8192, 65536] {
         let payload = positioned_payload(size);
         let (write_ok, received) = read_line_through_conpty(&payload, false);
+        // `windows(0)` panics with "window size must be non-zero", which is how
+        // a read that returned nothing at all used to present: an unrelated
+        // panic message instead of the measurement that would have explained
+        // it. Say what actually happened.
+        assert!(
+            !received.is_empty(),
+            "read nothing back for {size} bytes. Either the write never landed or              there is no console behind this pseudo-console; the latter is what              happens on a headless runner, which is why this test is #[ignore]."
+        );
         let leading_loss = payload
             .windows(received.len())
             .position(|window| window == received)
@@ -99,6 +127,7 @@ fn measure_conpty_single_write_delivery() {
 }
 
 #[test]
+#[ignore = "needs a real console; see the module comment"]
 fn measure_conpty_write_before_child_drains() {
     let payload = positioned_payload(65536);
     let (write_ok, received) = read_line_through_conpty(&payload, true);
