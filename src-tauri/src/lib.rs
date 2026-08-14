@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
@@ -765,6 +766,57 @@ where
     }
 }
 
+/// Which worktree an isolated session should run in: the one it was already
+/// working in, or a new one.
+///
+/// Restoring a pane must not quietly duplicate its worktree. The one from the
+/// last run can hold uncommitted agent work — `worktree::remove` refuses to
+/// delete a dirty worktree for exactly that reason — and a worktree no pane
+/// points at is work the app can no longer lead the user back to. So a fresh one
+/// is cut only when the old one is genuinely gone (or belonged to a different
+/// project); a directory that is still on disk but unusable refuses the spawn
+/// instead, naming the path so the user can recover it.
+///
+/// `create` is injected so a test can assert it was *not* called.
+fn choose_worktree<F>(
+    root: &Path,
+    session_id: &str,
+    saved: Option<&worktree::Saved>,
+    create: F,
+) -> Result<worktree::Worktree, String>
+where
+    F: FnOnce(&Path, &str) -> Result<worktree::Worktree, String>,
+{
+    if let Some(saved) = saved {
+        match worktree::reattach(root, saved) {
+            worktree::Reattach::Reused(w) => return Ok(w),
+            worktree::Reattach::Unusable(why) => {
+                return Err(format!(
+                    "the worktree {session_id} was working in is still on disk at {} but {why}. \
+                     Mosaic will not create a second one, because the first may hold uncommitted \
+                     work — recover or delete it, then start the session again",
+                    saved.path
+                ))
+            }
+            // Nothing left to strand: cut a fresh one below.
+            worktree::Reattach::Missing | worktree::Reattach::Foreign => {}
+        }
+    }
+    create(root, session_id)
+}
+
+/// Which worktree a session ended up in, pushed to the frontend so it can
+/// remember it and put the session back there after a restart.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionWorktree {
+    session_id: String,
+    repo: String,
+    path: String,
+    branch: String,
+    base: String,
+}
+
 /// Spawn a session under `session_id` and stream its output over `channel` until
 /// the child exits. Returns as soon as streaming ends; the frontend fires it
 /// without awaiting and addresses the session by the id it supplied.
@@ -786,6 +838,9 @@ async fn spawn_session(
     cols: u16,
     cwd: Option<String>,
     isolate: Option<bool>,
+    // The worktree this session used before the app was last closed, when the
+    // frontend is restoring a remembered pane. See `choose_worktree`.
+    reuse_worktree: Option<worktree::Saved>,
 ) -> Result<(), SpawnError> {
     // Refuse a session id that is already live. Inserting over one would replace
     // the handle without killing the process or removing its worktree, orphaning
@@ -812,8 +867,17 @@ async fn spawn_session(
         isolate.unwrap_or(false),
         &session_id,
         &project,
-        worktree::create,
+        |root, id| choose_worktree(root, id, reuse_worktree.as_ref(), worktree::create),
     )?;
+    // Captured before the worktree is handed to the rollback guard, and emitted
+    // only once the session is actually live — see below.
+    let session_worktree = worktree.as_ref().map(|w| SessionWorktree {
+        session_id: session_id.clone(),
+        repo: w.repo.to_string_lossy().to_string(),
+        path: w.path.to_string_lossy().to_string(),
+        branch: w.branch.clone(),
+        base: w.base.clone(),
+    });
     rollback.worktree = worktree;
 
     // EVERY session gets its own endpoint, isolated or not. Because that port is
@@ -905,6 +969,14 @@ async fn spawn_session(
         );
         reader
     };
+
+    // Now that the session is live, tell the frontend which worktree it got, so a
+    // restart can put this pane back into it. Deliberately after insertion: a
+    // spawn that failed earlier has had its worktree rolled back, and the
+    // frontend must not be left remembering one that no longer exists.
+    if let Some(event) = session_worktree {
+        let _ = app.emit("session-worktree", event);
+    }
 
     // Blocking reads on their own thread → async forward loop via mpsc.
     // Bound each session's pending output to roughly 512 KiB. Backpressure here
@@ -1020,6 +1092,26 @@ fn set_project(shared: State<'_, Arc<mcp::Shared>>, path: Option<String>) {
     shared.set_dir(dir);
 }
 
+#[tauri::command]
+fn project_is_repo(dir: String) -> bool {
+    worktree::repo_root(Path::new(&dir)).is_some()
+}
+
+#[tauri::command]
+fn init_project_repo(dir: String) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("init")
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| format!("failed to run git init in {dir}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("git init failed in {dir}: {detail}"))
+    }
+}
+
 /// Loopback URL + port of the in-process MCP server, for per-session registration.
 #[derive(Clone, Serialize)]
 struct McpInfo {
@@ -1131,10 +1223,11 @@ fn human_dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_mcp_wiring, delivery_allowance_ms, is_agent_cli, is_codex, ready_to_submit,
-        resolve_isolation, submit_ceiling_ms, submit_floor_ms, validate_human_dispatch, worktree,
-        IsolationReason, SpawnErrorKind, SpawnRollback, CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS,
-        SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS, SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
+        agent_mcp_wiring, choose_worktree, delivery_allowance_ms, is_agent_cli, is_codex,
+        ready_to_submit, resolve_isolation, submit_ceiling_ms, submit_floor_ms,
+        validate_human_dispatch, worktree, IsolationReason, SpawnErrorKind, SpawnRollback,
+        CODEX_TOKEN_ENV, SUBMIT_BYTES_PER_MS, SUBMIT_CEILING_MS, SUBMIT_DELIVERY_CAP_MS,
+        SUBMIT_FLOOR_MS, SUBMIT_QUIET_MS,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1203,6 +1296,129 @@ mod tests {
         assert!(
             path.join("in-progress.txt").exists(),
             "rollback must not discard uncommitted work"
+        );
+    }
+
+    // ---- Restoring an isolated pane ----
+    //
+    // The failure these guard against is silent: a restored session cuts itself a
+    // second worktree, and the one holding the agent's uncommitted work is left
+    // with nothing pointing at it.
+
+    fn saved_from(wt: &worktree::Worktree) -> worktree::Saved {
+        worktree::Saved {
+            repo: wt.repo.to_string_lossy().to_string(),
+            path: wt.path.to_string_lossy().to_string(),
+            branch: wt.branch.clone(),
+            base: wt.base.clone(),
+        }
+    }
+
+    /// Stands in for `worktree::create` where creating one would be the bug.
+    fn create_must_not_be_called(
+        _repo: &Path,
+        _session_id: &str,
+    ) -> Result<worktree::Worktree, String> {
+        panic!("a second worktree must not be created while the first is on disk");
+    }
+
+    #[test]
+    fn a_restored_session_goes_back_into_its_own_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-restore");
+        let repo = wt.repo.clone();
+        fs::write(wt.path.join("in-progress.txt"), "unsaved").unwrap();
+
+        let chosen = choose_worktree(
+            &repo,
+            "sess-restore",
+            Some(&saved_from(&wt)),
+            create_must_not_be_called,
+        )
+        .expect("an intact worktree should be reused");
+
+        assert_eq!(chosen.path, wt.path);
+        assert!(
+            chosen.path.join("in-progress.txt").exists(),
+            "the restored session must land on the work it left behind"
+        );
+    }
+
+    #[test]
+    fn a_restored_session_gets_a_new_worktree_only_when_the_old_one_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-clean-exit");
+        let repo = wt.repo.clone();
+        let saved = saved_from(&wt);
+        // Last run ended clean, so cleanup took the worktree with it.
+        worktree::remove(&wt).unwrap();
+
+        let base = tmp.path().join("fresh");
+        let chosen = choose_worktree(&repo, "sess-clean-exit", Some(&saved), |r, s| {
+            worktree::create_with_base_dir(r, s, &base)
+        })
+        .expect("a vanished worktree should be replaced");
+
+        assert!(chosen.path.exists());
+        assert_ne!(chosen.path, wt.path);
+    }
+
+    #[test]
+    fn an_unusable_worktree_refuses_the_spawn_rather_than_stranding_it() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-unusable");
+        let repo = wt.repo.clone();
+
+        // On disk, holding work, but not registered with this repo any more.
+        let orphan = tmp.path().join("orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("in-progress.txt"), "unsaved").unwrap();
+        let saved = worktree::Saved {
+            repo: repo.to_string_lossy().to_string(),
+            path: orphan.to_string_lossy().to_string(),
+            branch: "mosaic/sess-unusable".to_string(),
+            base: wt.base.clone(),
+        };
+
+        // `Worktree` has no Debug, so `expect_err` is unavailable here.
+        let err = match choose_worktree(
+            &repo,
+            "sess-unusable",
+            Some(&saved),
+            create_must_not_be_called,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a worktree still on disk must not be silently abandoned"),
+        };
+
+        assert!(
+            err.contains(&orphan.to_string_lossy().to_string()),
+            "the message must name the path so the work can be recovered: {err}"
+        );
+        assert!(orphan.join("in-progress.txt").exists());
+    }
+
+    #[test]
+    fn switching_projects_leaves_the_old_project_worktree_alone() {
+        let tmp = TempDir::new().unwrap();
+        let wt = worktree_fixture(&tmp, "sess-moved");
+
+        // A different repo is now the project; the saved worktree belongs to the
+        // old one, which still tracks it.
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        worktree::init_test_repo(&other).unwrap();
+
+        let base = tmp.path().join("fresh");
+        let chosen = choose_worktree(&other, "sess-moved", Some(&saved_from(&wt)), |r, s| {
+            worktree::create_with_base_dir(r, s, &base)
+        })
+        .expect("a session in a new project gets a worktree of that project");
+
+        assert_ne!(chosen.path, wt.path);
+        assert!(
+            wt.path.exists(),
+            "the other project's worktree is untouched"
         );
     }
 
@@ -1287,6 +1503,21 @@ mod tests {
             !detail.retryable,
             "a directory will not become a repository by retrying"
         );
+    }
+
+    #[test]
+    fn project_repo_check_distinguishes_repo_from_plain_directory() {
+        let tmp = TempDir::new().unwrap();
+        let plain = tmp.path().join("plain");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        worktree::init_test_repo(&repo).unwrap();
+
+        assert!(!super::project_is_repo(
+            plain.to_string_lossy().into_owned()
+        ));
+        assert!(super::project_is_repo(repo.to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -1695,6 +1926,8 @@ pub fn run() {
             set_conductor,
             halt_conductor,
             set_project,
+            project_is_repo,
+            init_project_repo,
             human_dispatch
         ])
         .on_window_event(|window, event| {

@@ -30,6 +30,19 @@ export const SESSION_TYPES: SessionType[] = [
   { id: "opencode", label: "opencode", program: "opencode", args: [], color: "#9ece6a" },
 ];
 
+// The git worktree an isolated session runs in. Reported by the backend once the
+// session is live (the `session-worktree` event) and handed back on the next
+// launch so a restored pane returns to the worktree it was already working in
+// instead of stranding it — see `choose_worktree` in the backend.
+export type SavedWorktree = {
+  repo: string;
+  path: string;
+  branch: string;
+  base: string;
+};
+
+export type SessionWorktreeEvent = SavedWorktree & { sessionId: string };
+
 export function spawnSession(
   sessionId: string,
   channel: Channel<Bytes>,
@@ -37,7 +50,7 @@ export function spawnSession(
   args: string[],
   rows: number,
   cols: number,
-  opts?: { cwd?: string; isolate?: boolean },
+  opts?: { cwd?: string; isolate?: boolean; reuseWorktree?: SavedWorktree },
 ): Promise<void> {
   return invoke("spawn_session", {
     sessionId,
@@ -48,6 +61,7 @@ export function spawnSession(
     cols,
     cwd: opts?.cwd,
     isolate: opts?.isolate,
+    reuseWorktree: opts?.reuseWorktree,
   });
 }
 
@@ -83,6 +97,12 @@ export const setAgentBrain = (name: string, brain: string): Promise<void> =>
 export const setProject = (path: string | null): Promise<void> =>
   invoke("set_project", { path });
 
+export const projectIsRepo = (dir: string): Promise<boolean> =>
+  invoke("project_is_repo", { dir });
+
+export const initProjectRepo = (dir: string): Promise<void> =>
+  invoke("init_project_repo", { dir });
+
 // ---- Conductor ----
 export type ConductorTask = {
   id: string;
@@ -94,7 +114,12 @@ export type ConductorTask = {
   // cancelled, and its result is still accepted.
   status: string;
   result: string;
+  // Stamped once at dispatch and never moved. This is not when the task
+  // finished — see done_ms.
   ts_ms: number;
+  // When the task reached a terminal state, or null while it is still live
+  // (including in_review and rework, neither of which is finished).
+  done_ms: number | null;
 };
 export type ConductorState = {
   conductor: string | null;
