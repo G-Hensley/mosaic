@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "3xcwdb",
+  "rev": 1,
+  "title": "Raise the dispatch brief limit above one 1 KiB chunk",
+  "status": "backlog",
+  "priority": "P1",
+  "rank": 3000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:56Z",
+  "updated": "2026-08-13T09:18:56Z"
+}

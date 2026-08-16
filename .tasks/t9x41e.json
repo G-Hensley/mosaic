@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "t9x41e",
+  "rev": 1,
+  "title": "Report the TUI-versus-headless timeout gap upstream",
+  "status": "backlog",
+  "priority": "P3",
+  "rank": 10000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:59Z",
+  "updated": "2026-08-13T09:18:59Z"
+}

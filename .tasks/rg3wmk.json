@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "rg3wmk",
+  "rev": 1,
+  "title": "Give list_sessions capability profiles for routing",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 7000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:57Z",
+  "updated": "2026-08-13T09:18:57Z"
+}

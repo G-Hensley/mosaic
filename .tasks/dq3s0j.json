@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "dq3s0j",
+  "rev": 2,
+  "title": "Add wait_for_tasks so a conductor can block on results",
+  "status": "backlog",
+  "priority": "P1",
+  "rank": 4000,
+  "done_when": "wait_for_tasks blocks on the given task ids until each reaches a terminal status or a timeout fires, returns the get_task_result payload, and tests prove both paths: early return on completion, and bounded return on a hung pane",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:56Z",
+  "updated": "2026-08-15T15:10:25Z"
+}

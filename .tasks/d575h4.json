@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "d575h4",
+  "rev": 1,
+  "title": "Require a different-model review before a task is done",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 5000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:57Z",
+  "updated": "2026-08-13T09:18:57Z"
+}
