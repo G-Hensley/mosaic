@@ -1,0 +1,49 @@
+name: Linux build (advisory)
+
+# Does Mosaic still build on Linux? Groundwork for a possible Fedora port.
+#
+# Nothing in the Rust is Windows-gated outside `worktree.rs`'s path comparison
+# and the ConPTY measurement harness, and portable-pty carries a Unix backend of
+# its own. The remaining Windows assumptions (the `cmd.exe /c` launch routing,
+# `LOCALAPPDATA`, the PowerShell shell type) are runtime choices rather than
+# compile-time ones, so this should build today.
+#
+# Deliberately NOT on pull_request. A cold Tauri dependency tree plus an apt
+# install of WebKitGTK is tens of minutes with no cache, and this answers a
+# question that changes on the scale of weeks, not per commit. Paying that on
+# every PR buys nothing and blocks work that has nothing to do with Linux.
+# Weekly, or on demand before doing port work, is the right cadence.
+#
+# Make this required, and move it into ci.yml, only once a Linux port lands and
+# the repo actually supports the platform.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: clippy
+      # Tauri's Linux prerequisites. The crate links against WebKitGTK, so
+      # without these the build fails for reasons that say nothing about Mosaic.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libayatana-appindicator3-dev libxdo-dev libssl-dev
+        working-directory: .
+      - run: cargo clippy --all-targets
+      - run: cargo test
