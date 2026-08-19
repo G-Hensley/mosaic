@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "zmk94k",
+  "rev": 1,
+  "title": "Measure whether disabling tools shrinks OpenCode's prompt",
+  "status": "backlog",
+  "priority": "P3",
+  "rank": 11000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:59Z",
+  "updated": "2026-08-13T09:18:59Z"
+}

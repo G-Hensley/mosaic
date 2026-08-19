@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "e18r66",
+  "rev": 1,
+  "title": "Detect dead panes and mark their tasks abandoned",
+  "status": "backlog",
+  "priority": "P1",
+  "rank": 1000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:55Z",
+  "updated": "2026-08-13T09:18:55Z"
+}

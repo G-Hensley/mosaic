@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "y4fz0h",
+  "rev": 1,
+  "title": "Run dispatched tasks headlessly instead of via the TUI",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 6000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:57Z",
+  "updated": "2026-08-13T09:18:57Z"
+}

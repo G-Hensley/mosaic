@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "jz8nsh",
+  "rev": 1,
+  "title": "Let the conductor open sessions, with human approval",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 8000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:58Z",
+  "updated": "2026-08-13T09:18:58Z"
+}

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "d4nhzh",
+  "rev": 1,
+  "title": "Window get_task_result to open and recent tasks",
+  "status": "backlog",
+  "priority": "P1",
+  "rank": 2000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:55Z",
+  "updated": "2026-08-13T09:18:55Z"
+}

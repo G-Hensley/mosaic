@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "e67nyf",
+  "rev": 1,
+  "title": "Enforce free-tier OpenRouter at the account, not config",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 9000,
+  "done_when": "",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-13T09:18:58Z",
+  "updated": "2026-08-13T09:18:58Z"
+}
