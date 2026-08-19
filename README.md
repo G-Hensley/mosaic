@@ -157,8 +157,10 @@ with no `task_id` returns every task that conductor dispatched in one call.
 - Only the conductor can dispatch, and the app assigns that role. An agent
   cannot claim it. Depth is bounded structurally: a dispatched agent is not
   the conductor, so it cannot dispatch onward.
-- 40 dispatches per run, 10-minute task timeout, and a Stop that cancels
-  everything pending.
+- 40 dispatches per run, and a Stop that cancels everything still pending.
+  A task older than 20 minutes is relabelled overdue, but that is a reporting
+  signal only: nothing is terminated, the agent process keeps running, and a
+  late result is still accepted.
 - A worktree branch is deleted only when it has no commits of its own, so
   committed agent work is never silently discarded. Cleanup also refuses to
   remove a dirty worktree, preserving uncommitted changes on disk.
@@ -180,17 +182,25 @@ with no `task_id` returns every task that conductor dispatched in one call.
   diff.
 - **Dispatch assumes an idle target.** Instructions are typed into the
   target's terminal; if that agent is mid-task the input is swallowed and the
-  task sits pending until it times out.
+  task sits pending indefinitely. Nothing times it out.
+- **A finished agent can leave its task open.** Completion is an explicit
+  `complete_task` call, so a session that does the work and never makes that
+  call is indistinguishable, to the conductor, from one still thinking. There
+  is no terminal state for a pane that has died or gone quiet.
 - **Dirty worktree recovery is manual.** Closing a session refuses to remove
   its dirty worktree, preserving uncommitted edits on disk, but the UI does
   not yet show the preserved path or offer a recovery workflow.
-- **Shared context does not persist across restarts.** It lives in memory for
-  the running session; the markdown mirror under `.mosaic/context/` is
-  written for humans to read, not read back in on launch.
+- The markdown mirror under `.mosaic/context/` is written for humans to read
+  and is never read back. The shared context itself does persist: entries,
+  sessions, and tasks are rehydrated from `brain.jsonl` when the app opens a
+  project.
 - Fit layout is intended for at most 6 panes; scroll layout remains usable
   beyond that.
-- Thin test coverage: `cargo test` covers PTY submit timing and shared-brain
-  prompt formatting. Worktree isolation and the whole frontend are untested.
+- The frontend has no tests and no test tooling; `package.json` has no test
+  script. The Rust side is covered by unit tests in `lib.rs`, `mcp.rs`, and
+  `worktree.rs`. `src-tauri/tests/pty_truncation.rs` is a ConPTY measurement
+  harness rather than a regression test, ignored by default and run
+  deliberately (see its header for the command).
 - Single-user, single-machine threat model. See [SECURITY.md](SECURITY.md)
   for what that means in practice before pointing Mosaic at anything
   sensitive.
@@ -199,7 +209,7 @@ with no `task_id` returns every task that conductor dispatched in one call.
 
 ```powershell
 cd src-tauri
-cargo test        # Rust unit tests: PTY submit timing, shared-brain formatting
+cargo test        # Rust unit tests: PTY engine, shared brain, worktree isolation
 cd ..
 pnpm build         # tsc in strict mode, then the Vite production build
 ```

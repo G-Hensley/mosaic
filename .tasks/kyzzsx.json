@@ -1,0 +1,13 @@
+{
+  "schema": 2,
+  "id": "kyzzsx",
+  "rev": 2,
+  "title": "Authenticate the fallback MCP endpoint, or refuse to use it",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 12000,
+  "done_when": "A session that cannot bind its own per-session port either gets an authenticated shared endpoint or fails closed rather than silently falling back. Today mcp::start's shared endpoint has no auth middleware (src-tauri/src/mcp.rs:2900), so identity there is self-declared via set_session_identity and a caller can impersonate the conductor to dispatch, or impersonate a target to fake complete_task/review_task. Self-flagged as audit finding #6 at src-tauri/src/lib.rs:900.",
+  "created": "2026-08-19T19:48:11Z",
+  "updated": "2026-08-19T19:48:23Z",
+  "status_changed": "2026-08-19T19:48:11Z"
+}
