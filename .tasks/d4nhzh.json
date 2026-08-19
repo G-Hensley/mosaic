@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "d4nhzh",
-  "rev": 1,
+  "rev": 2,
   "title": "Window get_task_result to open and recent tasks",
-  "status": "backlog",
+  "status": "done",
   "priority": "P1",
   "rank": 2000,
-  "done_when": "",
+  "done_when": "Shipped. select_tasks keeps every open task plus 10 recent finished, and include_all or status bypasses the window (src-tauri/src/mcp.rs:1123). Verified 2026-08-19.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:55Z",
-  "updated": "2026-08-13T09:18:55Z"
+  "updated": "2026-08-19T19:47:44Z",
+  "status_changed": "2026-08-19T19:47:44Z"
 }

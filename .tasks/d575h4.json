@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "d575h4",
-  "rev": 1,
+  "rev": 2,
   "title": "Require a different-model review before a task is done",
-  "status": "backlog",
+  "status": "done",
   "priority": "P2",
   "rank": 5000,
-  "done_when": "",
+  "done_when": "Shipped in PR #16 (3efebac). Task carries reviewer, in_review and rework states, and review_task closes it; dispatch picks a reviewer unless one is named or review is waived (src-tauri/src/mcp.rs:627, 1499). Verified 2026-08-19.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:57Z",
-  "updated": "2026-08-13T09:18:57Z"
+  "updated": "2026-08-19T19:47:55Z",
+  "status_changed": "2026-08-19T19:47:55Z"
 }

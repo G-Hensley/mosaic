@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "dq3s0j",
-  "rev": 2,
+  "rev": 3,
   "title": "Add wait_for_tasks so a conductor can block on results",
   "status": "backlog",
   "priority": "P1",
   "rank": 4000,
-  "done_when": "wait_for_tasks blocks on the given task ids until each reaches a terminal status or a timeout fires, returns the get_task_result payload, and tests prove both paths: early return on completion, and bounded return on a hung pane",
+  "done_when": "wait_for_tasks blocks on the given task ids until each reaches a terminal status or a timeout fires, returns the get_task_result payload, and tests prove both paths: early return on completion, and bounded return on a hung pane. NOTE: unmerged work exists on feat/wait-and-nudge (fb1f041); review it before writing new. Blocked on e18r66, or a wait will hang forever on a dead pane's task.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:56Z",
-  "updated": "2026-08-15T15:10:25Z"
+  "updated": "2026-08-19T19:47:55Z",
+  "status_changed": "2026-08-15T15:10:25Z"
 }

@@ -9,8 +9,14 @@ permissions:
   contents: read
 
 jobs:
+  # Every job carries an explicit timeout. GitHub's default is 360 minutes,
+  # which is not a safety net so much as a way to burn most of a day of runner
+  # time before anyone notices a job is wedged. These bounds are generous
+  # against observed times (frontend ~15s, rust ~12m) and exist to fail fast,
+  # not to squeeze.
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
@@ -26,6 +32,7 @@ jobs:
 
   rust:
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: src-tauri

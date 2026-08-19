@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "e18r66",
-  "rev": 1,
+  "rev": 2,
   "title": "Detect dead panes and mark their tasks abandoned",
   "status": "backlog",
   "priority": "P1",
   "rank": 1000,
-  "done_when": "",
+  "done_when": "A task whose target session's process is gone reaches a terminal 'abandoned' status, distinct from cancelled (deliberate) and overdue (still working); list_sessions reports pane liveness so a conductor can avoid dispatching into a dead pane; tests cover the transition. Observed again 2026-08-19: three of five panes finished their work and never called complete_task, leaving the conductor unable to tell finished-but-silent from still-working.",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:55Z",
-  "updated": "2026-08-13T09:18:55Z"
+  "updated": "2026-08-19T19:48:08Z",
+  "status_changed": "2026-08-13T09:18:55Z"
 }
