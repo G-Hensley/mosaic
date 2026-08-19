@@ -1,0 +1,69 @@
+{
+  "items": {
+    "agent:toolsmith": {
+      "files": {
+        ".agents/agents/toolsmith.claude.yaml": "4e378f5db9c4fc3f74532a27135457654ea35f476103808b3f8df7d4e574b9a8",
+        ".agents/agents/toolsmith.codex.toml": "b3265425b99ef2433a7786936003e6aa2147bdda2b00d835108beab02ad0c441",
+        ".agents/agents/toolsmith.md": "0907fb84b2f83561aae7dc4286af8a6b97f9cc5fdfea6c9374fcbc3b73455140",
+        ".agents/agents/toolsmith.memory.yaml": "b5101784414527fa92f71d68489ee9a17cf4d720625245ac433e0898e85d0791",
+        ".agents/agents/toolsmith.opencode.yaml": "a62b26c3a3b45a2baa4ce0ce6f9ebc6db262c2c570a713cd6ecf2102c3c20aaa"
+      },
+      "source": "agent-library/toolsmith"
+    },
+    "mcp:context7": {
+      "files": {
+        ".agents/mcp/context7.yaml": "06fe018259926ffd5fb90ff47ea62069c8a6dab265ef62543d1e801b74e4edf5"
+      },
+      "source": "integration-library/mcp-registry/context7"
+    },
+    "mcp:github": {
+      "files": {
+        ".agents/mcp/github.yaml": "cd2efcae655e9b172d0ef9287a6d2df08b7e1767fcce41079f4242c5ee5cf702"
+      },
+      "source": "integration-library/mcp-registry/github"
+    },
+    "skill:create-skill": {
+      "files": {
+        ".agents/skills/create-skill/SKILL.md": "ec33c3cf52eac2d9a66f7d5d4971be28a9ccb54945b195cc404acfcaaecf657e",
+        ".agents/skills/create-skill/references/anti-patterns.md": "9969325692ccebef6e4af25092709b0fd1c5887e57e3cfd9e6af503e87da2135",
+        ".agents/skills/create-skill/references/bulletproofing-discipline-skills.md": "144fb9ecfe42f46367d41223ec0f03806fd23d8bfafd289ad7875c79ec928f97",
+        ".agents/skills/create-skill/references/description-discipline.md": "c15992c7d237a93739206963221a71804a9b3d7c8d09b13cb97bce49442a95c9",
+        ".agents/skills/create-skill/references/skill-template.md": "e1112eddd2affef28650e73259bde14f9ce35a831015f7fbd5085a6cd508cc2b",
+        ".agents/skills/create-skill/references/testing-skills.md": "d0d3db470f773aae24b9263ed6099b2129c1aba2133d56964705e3747ec7c62e"
+      },
+      "source": "skill-library/create-skill"
+    },
+    "skill:create-subagent": {
+      "files": {
+        ".agents/skills/create-subagent/SKILL.md": "4e299adcacfb1c412afba6cfe3ddce76fd6cd5b09d6f42995f5c8e7503b128f2",
+        ".agents/skills/create-subagent/references/agy-template.md": "d7b15953631912e0ab4827593766061e5c3b2a371df2d8991c9c4836c6e5d0f7",
+        ".agents/skills/create-subagent/references/best-practices.md": "42896bb6b3e1a28f355b301f6964484ac18ddf50e02168a88e1ceaa15b569a6f",
+        ".agents/skills/create-subagent/references/claude-template.md": "50f2781745faabaeaf79c5d34dd20625681f8df804f06644b4d857a76b0f1fb3",
+        ".agents/skills/create-subagent/references/codex-template.md": "8bf2eab108884c4806111cdac706e59c2255ddf874a11469e9d4fdb4d565b524",
+        ".agents/skills/create-subagent/references/memory-template.md": "281c43308bf61a1a32835fc2d98e4a3bb56f6847cd25615ff34bfd38ae079f8b",
+        ".agents/skills/create-subagent/references/opencode-template.md": "db22224fef4aa220f49bf453cc459a2cee0bfa9f702f243b2b5f7c0ae96b848e"
+      },
+      "source": "skill-library/create-subagent"
+    },
+    "skill:research": {
+      "files": {
+        ".agents/skills/research/SKILL.md": "affb9d3effa63ff210d951e8e1f9033f615d39d38e1fe4a6a1747dca21e8e294",
+        ".agents/skills/research/references/evidence-schema.md": "ca0b18cbc2fb5c61a23d17b4d9fe7902a585777ae1413aa9be008260db580874",
+        ".agents/skills/research/references/source-policy.md": "18cb2688c101bcf878a74c6913a8bff5bf22466e794f5ead9d869dc022566c41"
+      },
+      "source": "skill-library/research"
+    },
+    "skill:shape-ideas": {
+      "files": {
+        ".agents/skills/shape-ideas/SKILL.md": "f993c75293342d84ccb680bc1eca1908910918f52a43799c76aab04402edac3b",
+        ".agents/skills/shape-ideas/assets/increment.md": "ffc2cd26a4e94b8c974f3efebcb58b747c2513f984a2564b789af1e67d98f510",
+        ".agents/skills/shape-ideas/assets/north-star.md": "e6a284072fba742991de80fcc59d52d63d30864987c7ccc38bd0bab265d41020",
+        ".agents/skills/shape-ideas/references/definition-of-good.md": "5023f10710997f98209658de7fd25ceca29fe77dc55c35fe0edd52f764720a1e",
+        ".agents/skills/shape-ideas/references/increment-slicing.md": "b962b97a392e2873741b29e81e465cbb5728afaa72881f61c7626445091eda86",
+        ".agents/skills/shape-ideas/references/interview-passes.md": "9fc60603cf0a98dec7e27dfb948964ab16aa78b9cf9d791114ef76b9737583d6"
+      },
+      "source": "skill-library/shape-ideas"
+    }
+  },
+  "schema_version": 1
+}

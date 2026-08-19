@@ -1,0 +1,7 @@
+mode: subagent
+permission:
+  edit: allow
+  bash: ask
+  webfetch: allow
+  websearch: allow
+  skill: allow

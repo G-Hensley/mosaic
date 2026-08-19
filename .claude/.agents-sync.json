@@ -1,0 +1,12 @@
+{
+    "entries":  [
+                    ".claude/skills/create-skill",
+                    ".claude/skills/create-subagent",
+                    ".claude/skills/research",
+                    ".claude/skills/shape-ideas",
+                    ".claude/agents/toolsmith.md",
+                    ".codex/agents/toolsmith.toml",
+                    ".opencode/agents/toolsmith.md",
+                    "CLAUDE.md"
+                ]
+}

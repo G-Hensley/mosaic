@@ -1,0 +1,8 @@
+enabled: true
+scope: user
+promotion: review
+categories:
+  - artifact-patterns
+  - host-compatibility
+  - workflow-improvements
+  - promotion-candidates

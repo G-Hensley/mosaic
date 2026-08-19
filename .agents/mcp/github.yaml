@@ -1,0 +1,76 @@
+schema_version: 1
+name: github
+description: >-
+  Read GitHub as a research database: releases, tags, changelogs, commits,
+  issues, pull requests, and security advisories. Answers "when did this
+  actually change" and "is this fixed in version N" from the source of truth
+  rather than from articles about it.
+
+transport: http
+
+# The read-only variant of the remote endpoint. The base is
+# https://api.githubcopilot.com/mcp/ and the server's own documentation lists
+# /readonly among its supported URL patterns.
+#
+# Read-only is the deliberate default. This entry exists to *read* GitHub for
+# research, and the write tools carry a far larger blast radius: an agent that
+# can open issues, push commits, or merge pull requests on your account is a
+# different risk category from one that can list releases. Swap to the base URL
+# only if you have a specific reason to grant writes.
+url: https://api.githubcopilot.com/mcp/readonly
+
+auth:
+  # A token, not OAuth, and this is a concession to reality rather than a
+  # preference.
+  #
+  # OAuth is the better design here: GitHub documents OAuth 2.1 + PKCE and
+  # calls it more secure than a PAT, with short-lived credentials and automatic
+  # refresh. It was the original choice for exactly that reason.
+  #
+  # It does not work. Claude Code's MCP client requires Dynamic Client
+  # Registration and this endpoint does not support it, so every connection
+  # fails with "Incompatible auth server: does not support dynamic client
+  # registration". That is a known and open Claude Code limitation, not a
+  # misconfiguration here, and it affects any OAuth MCP server without DCR:
+  #   anthropics/claude-plugins-official#283  (this exact server)
+  #   anthropics/claude-code#3273, #52638, #67258
+  # A pre-configured client id does not help; the client attempts DCR anyway.
+  #
+  # So a PAT it is. GitHub documents `Authorization: Bearer <token>` for the
+  # remote server, the value never appears in any rendered file, and this works
+  # on every host rather than only the ones that implement DCR.
+  #
+  # Revisit if Claude Code gains support for pre-configured OAuth clients.
+  type: bearer
+  env: GITHUB_PERSONAL_ACCESS_TOKEN
+  required: true
+
+trust:
+  publisher: GitHub
+  source: https://github.com/github/github-mcp-server
+  note: >-
+    First-party GitHub service, so the data is authoritative rather than
+    aggregated. It still reaches your private repositories with your identity,
+    so the read-only endpoint is the default and write access is opt-in.
+
+verified_on: 2026-08-10
+verified_against: https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md
+currency_pointer: https://api.github.com/repos/github/github-mcp-server/releases/latest
+verification_notes: >-
+  Hosted remote server reached general availability on 2025-09-04 per GitHub's
+  own changelog, so it is not preview. This entry pins no version, because the
+  hosted endpoint is versionless; the release feed above tracks the local
+  binary and Docker image only. Two independent researchers disagreed on the
+  current release (v0.31.0 versus v1.9.0); the GitHub API settled it as v1.9.0
+  published 2026-08-10T13:10:20Z, prerelease false. That disagreement does not
+  affect this entry, since nothing here is version-pinned.
+  PAT scopes for this read-only entry: a classic token needs `repo` to read
+  private repositories, which also covers the security-advisory tools;
+  `public_repo` is enough if only public repositories matter. A fine-grained
+  token uses repository permissions instead of scopes, and GitHub states its
+  scope-based tool filtering does not apply to those. The minimal fine-grained
+  permission set was not verified from a primary source.
+
+  Switched from OAuth to a token on 2026-08-11 because Claude Code requires
+  Dynamic Client Registration, which this endpoint does not support. See the
+  auth block for the issue references.

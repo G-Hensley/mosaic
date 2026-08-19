@@ -1,0 +1,12 @@
+model: inherit
+permissionMode: default
+tools:
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - Bash
+  - WebFetch
+  - WebSearch
+  - Skill

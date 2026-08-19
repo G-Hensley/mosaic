@@ -1,0 +1,37 @@
+schema_version: 1
+name: context7
+description: >-
+  Version-specific library and framework documentation retrieval. Returns
+  current docs for a resolved library rather than whatever the model absorbed
+  during training.
+
+transport: http
+url: https://mcp.context7.com/mcp
+
+auth:
+  type: bearer
+  # Variable NAME only. The value never appears in this file or in any rendered
+  # host configuration. Set it in the user environment; `doctor` reports whether
+  # it is present and never reads it.
+  env: CONTEXT7_API_KEY
+  # A key is recommended rather than strictly required. Unauthenticated use has
+  # limits that are not published numerically.
+  required: false
+
+# Narrow what this server contributes to every conversation. Only Claude Code
+# defers tool schemas until use; on the other hosts an installed server's full
+# schema is paid for in every session.
+tools:
+  - resolve-library-id
+  - get-library-docs
+
+trust:
+  publisher: Upstash
+  source: https://github.com/upstash/context7
+  note: >-
+    Third-party remote service. Sends the library name and query text to
+    Context7. Do not use it to look up anything derived from private source.
+    Presence in an MCP directory is not a security review.
+
+verified_on: 2026-08-10
+verified_against: https://context7.com/docs/resources/all-clients

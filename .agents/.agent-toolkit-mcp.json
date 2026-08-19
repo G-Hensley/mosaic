@@ -1,0 +1,91 @@
+{
+  "entries": {
+    "claude|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json|context7": {
+      "entry": {
+        "headers": {
+          "Authorization": "Bearer ${CONTEXT7_API_KEY}"
+        },
+        "type": "http",
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "hash": "146cbc9c3031251e298748d56d3b740ab2790185c900ffff3d55038d6ad69af6",
+      "host": "claude",
+      "scope": "project",
+      "server": "context7",
+      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json"
+    },
+    "claude|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json|github": {
+      "entry": {
+        "headers": {
+          "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+        },
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/readonly"
+      },
+      "hash": "066283ae3fbc5b2ffc6f4e89445a8078f312fedd2ea276b9c74a1de3911c55b2",
+      "host": "claude",
+      "scope": "project",
+      "server": "github",
+      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.mcp.json"
+    },
+    "codex|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml|context7": {
+      "entry": {
+        "bearer_token_env_var": "CONTEXT7_API_KEY",
+        "enabled": true,
+        "enabled_tools": [
+          "resolve-library-id",
+          "get-library-docs"
+        ],
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "hash": "f3b4e39be70d6e1c5f369bf8bc17bb613e5b8f309f0b1881b8590126f051426d",
+      "host": "codex",
+      "scope": "project",
+      "server": "context7",
+      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml"
+    },
+    "codex|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml|github": {
+      "entry": {
+        "bearer_token_env_var": "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "enabled": true,
+        "url": "https://api.githubcopilot.com/mcp/readonly"
+      },
+      "hash": "2888fff23642d885d239715c23a5ec7583a00bee0a56a0c1a663ac51d9f5d3d0",
+      "host": "codex",
+      "scope": "project",
+      "server": "github",
+      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/.codex/config.toml"
+    },
+    "opencode|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json|context7": {
+      "entry": {
+        "enabled": true,
+        "headers": {
+          "Authorization": "Bearer {env:CONTEXT7_API_KEY}"
+        },
+        "type": "remote",
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "hash": "877772bbaba3705dd027273d490a06e038c4d21f55d85b3d7a3b0c03ac798be6",
+      "host": "opencode",
+      "scope": "project",
+      "server": "context7",
+      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json"
+    },
+    "opencode|project|C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json|github": {
+      "entry": {
+        "enabled": true,
+        "headers": {
+          "Authorization": "Bearer {env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+        },
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/readonly"
+      },
+      "hash": "19e346dc63aa1020f21d478eca081742db6c347104fae5c9a976ba49a89bb9b6",
+      "host": "opencode",
+      "scope": "project",
+      "server": "github",
+      "target": "C:/Users/Gavin Hensley/Projects/applications/mosaic/opencode.json"
+    }
+  },
+  "schema_version": 1
+}
