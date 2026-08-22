@@ -3,8 +3,9 @@
 Ideas are not commitments. Promote an item only once its trigger, ownership,
 security boundary, and validation method are understood.
 
-`IMPROVEMENT-AUDIT.md` holds findings from a point-in-time review of existing
-code. This file holds capabilities Mosaic does not have yet.
+This file holds capabilities Mosaic does not have yet. Findings from
+point-in-time reviews of existing code go to `IMPROVEMENT-AUDIT.md`, which is
+deliberately untracked (see `.gitignore`), so a fresh clone will not have it.
 
 ---
 
@@ -565,7 +566,7 @@ This is a privilege escalation and needs treating as such:
 - A conductor that can create sessions can create them in a loop. Bound it
   structurally, the way dispatch depth is already bounded by only the conductor
   being able to dispatch.
-- Interaction with `SESSION-RESTORE-PROPOSAL.md`: restored panes and
+- Interaction with session restore, below: restored panes and
   conductor-created panes should not fight over ids.
 
 ## Guardrail: OpenCode sessions must stay on free OpenRouter models
@@ -625,3 +626,152 @@ the wrong router looks equally tidy and spends money.
 Still outstanding, and still the only real guarantee: the account-side state
 (zero balance, auto top-up off, payment method removed, no BYOK keys). Config
 is declared intent; the balance is the enforcement.
+
+## The conductor's five-pill task strip hides the work it is meant to coordinate
+
+The conductor bar is an at-a-glance view only while the fan-out is small.
+`src/components/ConductorBar.tsx:42-60` reverses the task list, keeps five
+entries, truncates every brief after 38 characters, and leaves the full text
+behind a hover title. At six concurrent tasks the sixth is not merely compressed:
+it is absent from the feed. Similar briefs lose the parameters that distinguish
+them at exactly the point where a conductor needs to tell several branches of
+work apart.
+
+The backend has already outgrown the three-state board originally sketched for
+this. A task may be `pending`, `overdue`, `in_review`, `rework`, `done`,
+`error`, or `cancelled`; `src-tauri/src/mcp.rs:1085-1090` deliberately counts
+the first four as open because submitted work awaiting review is not finished.
+Reducing that lifecycle to Blocked, In Progress, and Completed would hide review
+debt and repeat the same mistake in a larger surface.
+
+**One premise has been tested by the code and refuted: PTY quiet time cannot
+identify a blocked agent.** The earlier proposal reused the submit-timing signal
+as a blocked detector. But `src-tauri/src/lib.rs:173-212` records why silence is
+ambiguous even for the narrower problem that signal actually solves. A target
+may stay silent while it buffers input, and an output gap may mean "has not
+started yet" rather than "has finished". Once a prompt is submitted, the same
+silence can be a model thinking, a tool waiting for approval, a cold local model,
+or a dead process. Naming any of those `blocked` from timing alone produces a
+confident state Mosaic did not observe.
+
+That does not make the scaling problem less real. It separates two pieces that
+should not be coupled:
+
+- The task surface can show every recorded state Mosaic actually knows today,
+  grouped into open, awaiting review, and terminal work without inventing a
+  diagnosis.
+- A future blocked state needs an explicit signal from the agent or tool
+  protocol. Process liveness can prove that a pane is dead, but neither process
+  liveness nor terminal silence can prove that a live pane wants human input.
+
+**The shape to aim for.** Replace the five-pill feed with a task board or drawer
+that shows every open task, gives `in_review` and `rework` their own visible
+treatment, keeps recent terminal work available without letting it crowd out
+live work, and focuses the target pane from each item. Build it from the task
+states already returned by `conductor_state` at
+`src-tauri/src/lib.rs:1150-1163`. Add `blocked` only when an agent-facing
+question or approval path can set and clear it explicitly. The board is a view
+of the task ledger, not a second task model.
+
+Open questions worth settling before building:
+
+- **Board versus drawer.** A permanent multi-column board makes parallel state
+  legible but takes space from the terminals, which are still the product. A
+  drawer preserves the cockpit until the conductor needs detail.
+- **How much terminal history stays visible.** Open work must never be dropped.
+  Recent terminal tasks are useful confirmation, but unbounded history recreates
+  the response-growth problem already fixed in `get_task_result`.
+- **Whether cards move tasks.** Status should come from the task lifecycle, not
+  drag-and-drop cosmetics. Reassignment and retry need server semantics before
+  the UI offers them.
+- **What earns `blocked`.** An explicit `ask_conductor` or approval event is
+  honest. Quiet-time inference is not.
+- **How results are inspected.** A card needs the full brief, result, reviewer,
+  and findings without forcing all of that text into the overview.
+
+## Restoring panes does not restore the agents that occupied them
+
+Session restore is partly built, but the honest boundary matters more than the
+word "restore". `src/lib/panes.ts:1-13` states what survives: what each pane was,
+not what it was doing. The roster stores the pane id, current session type,
+brain, isolation flag, and saved worktree at `src/lib/panes.ts:19-31`.
+`src/App.tsx:44-57` turns those records into fresh running panes on launch, and
+`src/App.tsx:119-144` restores brain assignments and saves roster changes.
+
+What comes back is topology and configuration. The PTY and child process died
+with the previous app. Conversation history lives inside the agent, internal
+reasoning is not exposed through MCP, terminal scrollback belonged to the old
+frontend and PTY, and in-flight requests cannot cross a server restart. A
+restored pane is therefore a fresh agent wearing an old pane id. UI and
+documentation should say "restore pane layout" or "reopen panes", never imply
+that Mosaic resumed an agent's context.
+
+Worktree identity is the exception because it is durable state outside the
+process. The frontend records the worktree reported by the backend so the next
+launch can return to it (`src/App.tsx:146-158`), and
+`src-tauri/src/worktree.rs:20-32` persists the fields needed to re-adopt it.
+The safety rule at `src-tauri/src/worktree.rs:168-180` is the important part:
+an existing directory is never written off merely because it cannot be
+reattached. It may contain uncommitted agent work. Restore must refuse or surface
+that condition, never silently create a replacement that strands the old work,
+and never delete a dirty worktree as cleanup.
+
+**The proposed project `.mosaic/layout.json` is not the path forward.** It was a
+design for a system that did not yet restore panes. The implementation now owns
+roster and layout state end to end in the frontend:
+`src/lib/panes.ts:105-120` reads and writes `mosaic.panes`, while
+`src/App.tsx:62-95` reads layout settings and the selected project from
+`localStorage`. Adding a second layout file now would create two authorities for
+the same pane order, brain assignment, isolation flag, and layout settings.
+Conflict-resolution rules between them would be complexity caused by the new
+store, not by the product.
+
+The tradeoff that motivated project-scoped storage is still real.
+`localStorage` is machine-local and `mosaic.panes` is one global key
+(`src/lib/panes.ts:17`). A roster created for one repository can therefore be
+read after the selected project changes, even though its brain assignments and
+worktree references belong to the earlier repository. Project movement and
+another machine are separate cases: a project-owned file travels with the
+checkout but writes product UI state into the repository; a project-keyed
+frontend store stays local but can distinguish repositories without adding
+tracked or untracked files. The current implementation chose frontend
+ownership, so the next step is to make that choice project-aware rather than
+reviving `layout.json`.
+
+Conductor identity is the remaining obvious hole. The frontend initializes it
+to `null` at `src/App.tsx:97-100`. The Tauri command at
+`src-tauri/src/lib.rs:1166-1171` only forwards the new value, and
+`src-tauri/src/mcp.rs:551-576` keeps it in memory. Reopened panes retain their
+ids and brains, but the user must promote the conductor again. Persisting the id
+is truthful because it restores a role assignment, not agent state. If that
+pane fails to restore, Mosaic must clear the saved conductor and say why rather
+than transferring authority to another pane.
+
+**The shape to aim for.** Keep the existing frontend-owned restore path, key
+roster and conductor state by a stable project identity, and restore the
+conductor only after its pane has spawned successfully. Continue treating each
+pane as a new process, preserve saved worktree references, and make partial
+restore failures visible without discarding the panes that remain valid. Layout
+settings may stay machine-local; the question is which settings are genuinely
+project-specific, not whether every setting can be put into one file.
+
+Open questions worth settling before building:
+
+- **Project identity.** A normalized absolute path is simple but changes when a
+  repository moves. Repository metadata can survive a move but needs a stable,
+  non-secret identifier and a fallback for non-Git projects.
+- **Storage scope.** Project-keyed `localStorage` matches the implementation and
+  avoids repository files. A project-owned store is portable across machines
+  but changes the repository boundary and needs an ignore and migration policy.
+- **Restore timing.** Automatic reopening is fast and is today's behavior. An
+  explicit prompt gives the user a way to start fresh when a saved roster is
+  large or stale.
+- **Conductor failure.** The role must be restored only to the recorded pane.
+  A missing or failed pane clears it; Mosaic must never silently promote a
+  substitute.
+- **What layout belongs to the project.** Pane membership and worktrees clearly
+  do. Window height and column preference may be user and machine preferences
+  rather than repository state.
+- **Dirty worktree recovery.** Reuse is already safer than replacement. If
+  reattachment fails, the UI still needs to lead the user to the preserved path
+  and explain why the pane was not reopened.
