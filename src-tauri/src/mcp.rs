@@ -1586,6 +1586,214 @@ impl BrainHandler {
     }
 }
 
+/// What every connecting agent is told about the workspace it just joined.
+///
+/// Exposing well-described tools is not enough on its own: an agent that is not
+/// told to consult shared context simply won't, and the brain stays empty while
+/// two agents build incompatible halves of the same thing. MCP carries these
+/// instructions on the connection itself, which is why this lives here rather
+/// than in each project's AGENTS.md â€” it reaches every session automatically,
+/// in whichever repo it was launched against.
+///
+/// The workspace section exists for a second, distinct failure: an agent that
+/// treats Mosaic as a nicer terminal and never notices the other panes are
+/// usable capacity. Because MCP delivers this text once, at connect time, it can
+/// only describe the role an agent *might* be given â€” the conductor briefing
+/// injected by `set_conductor` is what covers the role it actually has.
+const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
+
+Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
+
+## The workspace
+
+The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
+
+Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
+
+If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
+- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
+- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
+- Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
+- A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
+- This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
+
+If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
+
+## Shared context
+
+- BEFORE making a decision that affects shared work â€” architecture, dependencies, data models, API shapes, file layout, naming conventions â€” call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
+- Use search_context to check one specific topic before you spend effort researching it.
+- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here â€” it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
+- Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
+- Use broadcast for blockers, or anything the others need to know immediately."#;
+
+#[tool_handler]
+impl ServerHandler for BrainHandler {
+    // Supplying get_info suppresses the macro's generated one, so both the tools
+    // capability and our own name/version have to be restated here â€” otherwise
+    // no tools are advertised, and the server introduces itself to agents as
+    // "rmcp" (the default is resolved inside that crate, not ours).
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("mosaic", env!("CARGO_PKG_VERSION")))
+            .with_instructions(BRAIN_INSTRUCTIONS)
+    }
+}
+
+/// Bind the MCP server on a random loopback port and spawn it. Returns the port
+/// and the shared store (also used by the frontend `get_context` command).
+/// Bind a loopback endpoint dedicated to ONE session. Because only that session
+/// is registered against this port, every request on it is provably from that
+/// session â€” identity without a handshake.
+/// The caller owns the returned handle: dropping it does NOT stop the server, so
+/// it must be aborted explicitly when the session ends, or the listener outlives
+/// the session it was bound to.
+pub struct SessionServer {
+    pub port: u16,
+    /// Secret this session must present as `Authorization: Bearer <token>`.
+    /// Handed to the caller so it can be written into that one session's agent
+    /// config; it is never logged and never leaves the machine.
+    pub token: String,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl SessionServer {
+    /// Stop serving. Called when the session is killed or exits on its own.
+    pub fn shutdown(self) {
+        self.task.abort();
+    }
+}
+
+/// Mint a secret for one session's endpoint.
+///
+/// Two v4 UUIDs, whose randomness comes from the OS CSPRNG via `getrandom`,
+/// give 244 bits with no new dependency. Far past brute force, which matters
+/// because the endpoint sits on loopback where anything local can reach it and
+/// retry without limit.
+fn mint_session_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Whether an `Authorization` header carries exactly the expected bearer token.
+///
+/// Compared in constant time over the whole candidate so a caller cannot learn
+/// the secret one byte at a time from response latency. Localhost makes that
+/// attack awkward rather than impossible, and the cost of not leaking is a
+/// single XOR per byte. Split out from the middleware so it is directly
+/// testable without standing up a server.
+fn bearer_matches(header: Option<&str>, expected: &str) -> bool {
+    let Some(value) = header else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    if presented.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in presented.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+pub fn start_session_server(
+    shared: Arc<Shared>,
+    session_id: String,
+) -> std::io::Result<SessionServer> {
+    validate_path_component("session_id", &session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+    let token = mint_session_token();
+    let expected = token.clone();
+
+    let task = tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let service = StreamableHttpService::new(
+            move || Ok(BrainHandler::bound_to(shared.clone(), session_id.clone())),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        // The port still identifies WHICH session this is; the token proves the
+        // caller is that session rather than any other local process that
+        // guessed the port. Both checks, not one instead of the other.
+        let router =
+            axum::Router::new()
+                .nest_service("/mcp", service)
+                .layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let expected = expected.clone();
+                        async move {
+                            let header = req
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok());
+                            if bearer_matches(header, &expected) {
+                                next.run(req).await
+                            } else {
+                                axum::http::StatusCode::UNAUTHORIZED.into_response()
+                            }
+                        }
+                    },
+                ));
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok(SessionServer { port, token, task })
+}
+
+pub fn start(
+    app: AppHandle,
+    dir: PathBuf,
+    engine: Arc<crate::SessionManager>,
+) -> std::io::Result<(u16, Arc<Shared>)> {
+    let brain = load_brain(&dir);
+    let shared = Arc::new(Shared {
+        app: Notifier::to_app(app),
+        dir: Mutex::new(dir),
+        entries: Mutex::new(brain.entries),
+        sessions: Mutex::new(brain.sessions),
+        name_to_room: Mutex::new(HashMap::new()),
+        engine,
+        conductor: Mutex::new(None),
+        halted: Mutex::new(false),
+        tasks: Mutex::new(brain.tasks),
+        dispatches: Mutex::new(0),
+    });
+
+    // Bind synchronously so we can hand the port back before the server task runs.
+    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+
+    let shared_for_server = shared.clone();
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let service = StreamableHttpService::new(
+            move || Ok(BrainHandler::new(shared_for_server.clone())),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok((port, shared))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2729,212 +2937,4 @@ mod tests {
         assert!(loaded.tasks.is_empty());
         assert!(load_brain(&temp.path().join("missing")).entries.is_empty());
     }
-}
-
-/// What every connecting agent is told about the workspace it just joined.
-///
-/// Exposing well-described tools is not enough on its own: an agent that is not
-/// told to consult shared context simply won't, and the brain stays empty while
-/// two agents build incompatible halves of the same thing. MCP carries these
-/// instructions on the connection itself, which is why this lives here rather
-/// than in each project's AGENTS.md â€” it reaches every session automatically,
-/// in whichever repo it was launched against.
-///
-/// The workspace section exists for a second, distinct failure: an agent that
-/// treats Mosaic as a nicer terminal and never notices the other panes are
-/// usable capacity. Because MCP delivers this text once, at connect time, it can
-/// only describe the role an agent *might* be given â€” the conductor briefing
-/// injected by `set_conductor` is what covers the role it actually has.
-const BRAIN_INSTRUCTIONS: &str = r#"You are one of several AI agents working in parallel inside Mosaic, each in its own terminal, on the same project at the same time. This server is your shared brain: it is how you learn what the others have already decided, how they learn what you decide, and how work is handed between you.
-
-Mosaic already knows who you are from this connection. You do not need to call set_session_identity.
-
-## The workspace
-
-The other panes are not logs or history. They are live AI coding agents â€” often different models, each with its own separate context window â€” sitting idle until given work. Call list_sessions to see who is here.
-
-Mosaic gives exactly one session the conductor role, and the user assigns it; you cannot claim it. Call list_sessions to find out whether that is you, and expect the answer to change during a run.
-
-If you ARE the conductor, the rest of the workspace is yours to direct, and using it is the point of this tool:
-- Before doing a separable piece of work yourself, ask whether it should be dispatched instead. Independent slices â€” different files or subsystems, separate research questions, a second opinion from a different model â€” are what the other sessions are for.
-- dispatch returns immediately with a task_id rather than blocking. So dispatch every independent task first and collect afterwards; that is what makes the agents run in parallel instead of queueing behind each other.
-- Call get_task_result with no task_id to collect every task you dispatched in one call, rather than polling ids one at a time.
-- A dispatched agent cannot see your screen or your context. State the goal, the concrete paths, and what you want reported back.
-- This does not replace your own subagents. Prefer a Mosaic session when you want a different model or a genuinely separate context window; prefer your own subagents for work inside your own.
-
-If you are NOT the conductor, dispatch will refuse â€” that is expected, not an error to work around. When a line starting with "[mosaic] Task from conductor" appears in your terminal, that is real work assigned to you: carry it out, then call complete_task with the task_id you were given and a summary of the result. The conductor is waiting on that call.
-
-## Shared context
-
-- BEFORE making a decision that affects shared work â€” architecture, dependencies, data models, API shapes, file layout, naming conventions â€” call get_shared_context. Another agent may have already settled it. Do not re-derive or quietly contradict an existing decision; if you disagree with one, broadcast the disagreement instead of diverging in silence.
-- Use search_context to check one specific topic before you spend effort researching it.
-- AFTER making such a decision, call record_decision with the topic, the decision, and your reasoning. This is the single most important thing you do here â€” it is what stops two agents building halves that don't fit together. If you are dispatching work that depends on a convention, record it before you dispatch.
-- Use record_fact for durable things others will need: an API shape, a path, a command, a convention you just established.
-- Use broadcast for blockers, or anything the others need to know immediately."#;
-
-#[tool_handler]
-impl ServerHandler for BrainHandler {
-    // Supplying get_info suppresses the macro's generated one, so both the tools
-    // capability and our own name/version have to be restated here â€” otherwise
-    // no tools are advertised, and the server introduces itself to agents as
-    // "rmcp" (the default is resolved inside that crate, not ours).
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mosaic", env!("CARGO_PKG_VERSION")))
-            .with_instructions(BRAIN_INSTRUCTIONS)
-    }
-}
-
-/// Bind the MCP server on a random loopback port and spawn it. Returns the port
-/// and the shared store (also used by the frontend `get_context` command).
-/// Bind a loopback endpoint dedicated to ONE session. Because only that session
-/// is registered against this port, every request on it is provably from that
-/// session â€” identity without a handshake.
-/// The caller owns the returned handle: dropping it does NOT stop the server, so
-/// it must be aborted explicitly when the session ends, or the listener outlives
-/// the session it was bound to.
-pub struct SessionServer {
-    pub port: u16,
-    /// Secret this session must present as `Authorization: Bearer <token>`.
-    /// Handed to the caller so it can be written into that one session's agent
-    /// config; it is never logged and never leaves the machine.
-    pub token: String,
-    task: tauri::async_runtime::JoinHandle<()>,
-}
-
-impl SessionServer {
-    /// Stop serving. Called when the session is killed or exits on its own.
-    pub fn shutdown(self) {
-        self.task.abort();
-    }
-}
-
-/// Mint a secret for one session's endpoint.
-///
-/// Two v4 UUIDs, whose randomness comes from the OS CSPRNG via `getrandom`,
-/// give 244 bits with no new dependency. Far past brute force, which matters
-/// because the endpoint sits on loopback where anything local can reach it and
-/// retry without limit.
-fn mint_session_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-/// Whether an `Authorization` header carries exactly the expected bearer token.
-///
-/// Compared in constant time over the whole candidate so a caller cannot learn
-/// the secret one byte at a time from response latency. Localhost makes that
-/// attack awkward rather than impossible, and the cost of not leaking is a
-/// single XOR per byte. Split out from the middleware so it is directly
-/// testable without standing up a server.
-fn bearer_matches(header: Option<&str>, expected: &str) -> bool {
-    let Some(value) = header else {
-        return false;
-    };
-    let Some(presented) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    if presented.len() != expected.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in presented.bytes().zip(expected.bytes()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
-pub fn start_session_server(
-    shared: Arc<Shared>,
-    session_id: String,
-) -> std::io::Result<SessionServer> {
-    validate_path_component("session_id", &session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    std_listener.set_nonblocking(true)?;
-    let port = std_listener.local_addr()?.port();
-    let token = mint_session_token();
-    let expected = token.clone();
-
-    let task = tauri::async_runtime::spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let service = StreamableHttpService::new(
-            move || Ok(BrainHandler::bound_to(shared.clone(), session_id.clone())),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        );
-        // The port still identifies WHICH session this is; the token proves the
-        // caller is that session rather than any other local process that
-        // guessed the port. Both checks, not one instead of the other.
-        let router =
-            axum::Router::new()
-                .nest_service("/mcp", service)
-                .layer(axum::middleware::from_fn(
-                    move |req: axum::extract::Request, next: axum::middleware::Next| {
-                        let expected = expected.clone();
-                        async move {
-                            let header = req
-                                .headers()
-                                .get(axum::http::header::AUTHORIZATION)
-                                .and_then(|v| v.to_str().ok());
-                            if bearer_matches(header, &expected) {
-                                next.run(req).await
-                            } else {
-                                axum::http::StatusCode::UNAUTHORIZED.into_response()
-                            }
-                        }
-                    },
-                ));
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Ok(SessionServer { port, token, task })
-}
-
-pub fn start(
-    app: AppHandle,
-    dir: PathBuf,
-    engine: Arc<crate::SessionManager>,
-) -> std::io::Result<(u16, Arc<Shared>)> {
-    let brain = load_brain(&dir);
-    let shared = Arc::new(Shared {
-        app: Notifier::to_app(app),
-        dir: Mutex::new(dir),
-        entries: Mutex::new(brain.entries),
-        sessions: Mutex::new(brain.sessions),
-        name_to_room: Mutex::new(HashMap::new()),
-        engine,
-        conductor: Mutex::new(None),
-        halted: Mutex::new(false),
-        tasks: Mutex::new(brain.tasks),
-        dispatches: Mutex::new(0),
-    });
-
-    // Bind synchronously so we can hand the port back before the server task runs.
-    let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    std_listener.set_nonblocking(true)?;
-    let port = std_listener.local_addr()?.port();
-
-    let shared_for_server = shared.clone();
-    tauri::async_runtime::spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        let service = StreamableHttpService::new(
-            move || Ok(BrainHandler::new(shared_for_server.clone())),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        );
-        let router = axum::Router::new().nest_service("/mcp", service);
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Ok((port, shared))
 }
