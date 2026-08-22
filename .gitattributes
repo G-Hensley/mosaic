@@ -1,0 +1,37 @@
+# Line endings are declared here rather than left to each machine's
+# core.autocrlf. Without this file, a Windows checkout with autocrlf=true hands
+# every worktree a CRLF working copy, while the agent tooling that edits these
+# files writes LF. The content is identical and `git diff` is empty, but
+# `git status` reports the files as modified anyway, in every worktree, forever.
+# That was costing real attention: an agent opening a pane could not tell its own
+# uncommitted work from the noise.
+#
+# Normalize to LF in the repository and in the working tree. The one exception is
+# the Windows batch scripts, which stay CRLF: cmd.exe reads a batch file as it
+# runs it, and LF-only line endings can break `goto` and label handling.
+
+* text=auto eol=lf
+
+# Windows batch wrappers must keep CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Explicitly binary, so Git never tries to translate them.
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.exe binary
+*.dll binary
+*.pdf binary
+
+# Generated. Collapse them in diffs and keep them out of language stats.
+pnpm-lock.yaml -diff linguist-generated
+src-tauri/Cargo.lock -diff linguist-generated
