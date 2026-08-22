@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "jz8nsh",
-  "rev": 1,
+  "rev": 2,
   "title": "Let the conductor open sessions, with human approval",
   "status": "backlog",
   "priority": "P2",
   "rank": 8000,
-  "done_when": "",
+  "done_when": "A conductor can request one named session kind, Mosaic shows the human the program, quota and worktree effects before spawning, only explicit approval starts it, denial starts nothing, a tested ceiling prevents request loops, and restored and newly created pane ids cannot collide (BACKLOG.md:549-569).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:58Z",
-  "updated": "2026-08-13T09:18:58Z"
+  "updated": "2026-08-22T03:52:31Z",
+  "status_changed": "2026-08-13T09:18:58Z"
 }

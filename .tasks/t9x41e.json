@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "t9x41e",
-  "rev": 1,
+  "rev": 2,
   "title": "Report the TUI-versus-headless timeout gap upstream",
   "status": "backlog",
   "priority": "P3",
   "rank": 10000,
-  "done_when": "",
+  "done_when": "An upstream OpenCode issue carries a minimal reproduction showing the same cold model cancelling in the TUI at about 30 seconds but completing twice under opencode run at about 33 seconds, includes exact versions and configuration, links the related timeout issues, and this task records the issue URL (BACKLOG.md:45-50).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:59Z",
-  "updated": "2026-08-13T09:18:59Z"
+  "updated": "2026-08-22T03:52:32Z",
+  "status_changed": "2026-08-13T09:18:59Z"
 }

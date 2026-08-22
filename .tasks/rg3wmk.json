@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "rg3wmk",
-  "rev": 1,
+  "rev": 2,
   "title": "Give list_sessions capability profiles for routing",
   "status": "backlog",
   "priority": "P2",
   "rank": 7000,
-  "done_when": "",
+  "done_when": "list_sessions reports each pane actual model plus a machine-readable capability summary covering strengths, context, cost tier, tool support, latency and liveness; profiles come from a configurable maintained source, and absence of that source falls back to the current CLI-only roster. Correct the misleading model versus CLI wording at src-tauri/src/mcp.rs:1403 even before the full feature (BACKLOG.md:505-546).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:57Z",
-  "updated": "2026-08-13T09:18:57Z"
+  "updated": "2026-08-22T03:52:21Z",
+  "status_changed": "2026-08-13T09:18:57Z"
 }

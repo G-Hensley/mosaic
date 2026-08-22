@@ -1,0 +1,16 @@
+{
+  "schema": 2,
+  "id": "6v3ebz",
+  "rev": 3,
+  "title": "Let a blocked agent ask the conductor, not the human",
+  "status": "backlog",
+  "priority": "P1",
+  "rank": 13000,
+  "done_when": "A dispatched agent can pose a question against its task_id, the task moves to a distinct blocked state that a conductor collecting results can see, the answer is delivered back to the waiting agent, and the exchange is recorded on the task rather than lost. A bounded ceiling prevents a pane interrupting in a loop, and the fallback to the human when no conductor is live or it is halted is deliberate rather than silent. Shares one mechanism with dq3s0j rather than growing a second (BACKLOG.md:400-446).",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-22T03:52:39Z",
+  "updated": "2026-08-22T03:53:10Z",
+  "status_changed": "2026-08-22T03:52:39Z"
+}

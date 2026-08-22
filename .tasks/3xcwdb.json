@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "3xcwdb",
-  "rev": 1,
+  "rev": 2,
   "title": "Raise the dispatch brief limit above one 1 KiB chunk",
   "status": "backlog",
   "priority": "P1",
   "rank": 3000,
-  "done_when": "",
+  "done_when": "A deterministic real-agent TUI test proves briefs of at least 8 KiB arrive byte-for-byte at both the Codex and OpenCode composers before submission, dispatch then raises its injection ceiling to the largest proven safe bound, and regression tests still refuse the first unsafe size without recording or charging a task. The current 1024-byte refusal is the bounding fix only, not the fix (BACKLOG.md:267-289).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:56Z",
-  "updated": "2026-08-13T09:18:56Z"
+  "updated": "2026-08-22T03:52:21Z",
+  "status_changed": "2026-08-13T09:18:56Z"
 }

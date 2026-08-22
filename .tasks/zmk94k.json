@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "zmk94k",
-  "rev": 1,
+  "rev": 2,
   "title": "Measure whether disabling tools shrinks OpenCode's prompt",
   "status": "backlog",
   "priority": "P3",
   "rank": 11000,
-  "done_when": "",
+  "done_when": "A logging proxy captures otherwise identical OpenCode requests with tools enabled and disabled, records prompt token and byte counts and whether tool definitions are removed, repeats both conditions enough to separate the effect from noise, and records whether any reduction changes cold-start success against the 30-second TUI budget (BACKLOG.md:131-134).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:59Z",
-  "updated": "2026-08-13T09:18:59Z"
+  "updated": "2026-08-22T03:52:32Z",
+  "status_changed": "2026-08-13T09:18:59Z"
 }

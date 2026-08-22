@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "e67nyf",
-  "rev": 1,
+  "rev": 2,
   "title": "Enforce free-tier OpenRouter at the account, not config",
   "status": "backlog",
   "priority": "P2",
   "rank": 9000,
-  "done_when": "",
+  "done_when": "The OpenRouter account used by OpenCode has zero balance, auto top-up disabled, no payment method and no BYOK keys; a documented verification records those four account-side checks and demonstrates that selecting a billable model cannot incur a charge. Config is declared intent, the balance is the enforcement (BACKLOG.md:625-627).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:58Z",
-  "updated": "2026-08-13T09:18:58Z"
+  "updated": "2026-08-22T03:52:32Z",
+  "status_changed": "2026-08-13T09:18:58Z"
 }

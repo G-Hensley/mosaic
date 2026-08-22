@@ -1,15 +1,16 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "y4fz0h",
-  "rev": 1,
+  "rev": 2,
   "title": "Run dispatched tasks headlessly instead of via the TUI",
   "status": "backlog",
   "priority": "P2",
   "rank": 6000,
-  "done_when": "",
+  "done_when": "A dispatched OpenCode task can run through opencode run while its pane stays interactive, uses the intended model and task identity, returns through the normal Mosaic result and review lifecycle, exposes progress and cancellation visibly, and an integration test proves a cold request exceeding 30 seconds completes without terminal-injection truncation (BACKLOG.md:75-87).",
   "links": [
     "BACKLOG.md"
   ],
   "created": "2026-08-13T09:18:57Z",
-  "updated": "2026-08-13T09:18:57Z"
+  "updated": "2026-08-22T03:52:21Z",
+  "status_changed": "2026-08-13T09:18:57Z"
 }

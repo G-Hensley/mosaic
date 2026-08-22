@@ -1,0 +1,16 @@
+{
+  "schema": 2,
+  "id": "7c7f3j",
+  "rev": 3,
+  "title": "Replace the five-pill conductor feed with a truthful task board",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 14000,
+  "done_when": "The conductor can open a keyboard-accessible task surface that shows every open task without truncating its distinguishing brief, visibly separates pending, overdue, in_review, rework and terminal states, focuses the target pane from a task, bounds finished history, and tests prove a sixth concurrent task stays visible and that terminal silence is never labelled blocked without an explicit blocked event (BACKLOG.md:629).",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-22T03:52:40Z",
+  "updated": "2026-08-22T03:53:10Z",
+  "status_changed": "2026-08-22T03:52:40Z"
+}

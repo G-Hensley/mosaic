@@ -1,0 +1,16 @@
+{
+  "schema": 2,
+  "id": "rd85p4",
+  "rev": 3,
+  "title": "Scope restored panes to their project and persist the conductor",
+  "status": "backlog",
+  "priority": "P2",
+  "rank": 15000,
+  "done_when": "Pane rosters and conductor identity are stored and loaded per project, a successful restart reopens the same pane ids, brains, isolation flags, saved worktrees and conductor as fresh processes, a missing conductor pane clears the role with a visible explanation, switching projects never restores another project panes, dirty or unusable worktrees are preserved and reported, and tests cover restart, project switching, corrupt saved state, failed pane spawn and conductor restore failure (BACKLOG.md:691).",
+  "links": [
+    "BACKLOG.md"
+  ],
+  "created": "2026-08-22T03:52:40Z",
+  "updated": "2026-08-22T03:53:11Z",
+  "status_changed": "2026-08-22T03:52:40Z"
+}
